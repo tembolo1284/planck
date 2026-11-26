@@ -99,3 +99,24 @@ if(PLANCK_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+add_library(planck_net STATIC
+    src/net/address.cpp
+    src/net/poller.cpp
+    src/net/socket.cpp
+)
+add_library(planck::net ALIAS planck_net)
+target_link_libraries(planck_net PUBLIC planck_sys)
+
+add_library(planck_gateway STATIC
+    src/gateway/gateway.cpp
+)
+add_library(planck::gateway ALIAS planck_gateway)
+target_link_libraries(planck_gateway PUBLIC planck_engine planck_net)
+
+add_library(planck_feed STATIC
+    src/feed/publisher.cpp
+    src/feed/receiver.cpp
+)
+add_library(planck::feed ALIAS planck_feed)
+target_link_libraries(planck_feed PUBLIC planck_engine planck_net)

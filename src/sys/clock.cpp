@@ -132,4 +132,11 @@ Status TscClock::calibrate(Nanos window) noexcept {
     return Status::Ok;
 }
 
+void TscClock::reanchor() noexcept {
+    PLANCK_EXPECT(calibrated());
+    const ClockSample anchor = sample_wall();
+    base_tsc_ = anchor.tsc;
+    base_wall_ = anchor.time;
+}
+
 }  // namespace planck::sys

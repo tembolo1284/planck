@@ -36,6 +36,7 @@ planck_add_test(planck_unit_tests LABEL unit SOURCES
     unit/order_book_test.cpp
     unit/wire_test.cpp
     unit/shard_test.cpp
+    unit/net_test.cpp
 )
 
 # Randomized checks against an independent model. Scale with PLANCK_TEST_SCALE.
@@ -44,8 +45,13 @@ planck_add_test(planck_property_tests LABEL property SOURCES
     property/shard_audit_test.cpp
 )
 
-# More than one thread.
+# More than one thread, or real sockets on the loopback interface.
 planck_add_test(planck_integration_tests LABEL integration SOURCES
     integration/ring_stress_test.cpp
     integration/shard_thread_test.cpp
+    integration/gateway_test.cpp
+    integration/feed_test.cpp
+    integration/full_stack_test.cpp
 )
+
+target_link_libraries(${name} PRIVATE planck::gateway planck::feed GTest::gtest_main)

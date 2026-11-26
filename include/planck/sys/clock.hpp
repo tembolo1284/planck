@@ -85,6 +85,17 @@ public:
     // more accurate rate. Run it on the CPU that will do the timing.
     [[nodiscard]] core::Status calibrate(core::Nanos window = kDefaultWindow) noexcept;
 
+    // Line the clock up with CLOCK_REALTIME again, keeping the measured
+    // rate. The anchor set by calibrate() slowly goes stale: the kernel
+    // steers the wall clock and this clock does not follow. Call this now
+    // and then from a quiet moment, never from the middle of timed work. It
+    // costs a few hundred nanoseconds. Wall-clock readings may step, in
+    // either direction, across a call.
+    void reanchor() noexcept;
+
+    // Counter reading at the last calibrate() or reanchor().
+    [[nodiscard]] std::uint64_t anchor_tsc() const noexcept { return base_tsc_; }
+
     [[nodiscard]] bool calibrated() const noexcept { return mult_ != 0; }
 
     [[nodiscard]] std::uint64_t ticks_per_second() const noexcept { return ticks_per_second_; }
@@ -104,8 +115,8 @@ public:
         return base_wall_ + to_nanos(tsc - base_tsc_);
     }
 
-    // Wall-clock time without a system call. Drifts from CLOCK_REALTIME by
-    // the calibration error, so recalibrate off the hot path if that matters.
+    // Wall-clock time without a system call. Drifts from CLOCK_REALTIME
+    // between calls to reanchor().
     [[nodiscard]] core::Nanos now() const noexcept { return to_wall(tsc_now()); }
 
 private:

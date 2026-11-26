@@ -171,6 +171,10 @@ private:
     template <wire::Message T>
     void publish(const T& message) noexcept;
 
+    // Re-anchor the clock to the wall clock if that has not been done for a
+    // while. Called only when there is no work waiting.
+    void refresh_clock() noexcept;
+
     // Move staged messages into the rings if there is room. True if both
     // stages are now empty.
     [[nodiscard]] bool try_flush() noexcept;
@@ -183,6 +187,8 @@ private:
     Active active_{};
     std::uint64_t match_sequence_ = 1;
     std::uint64_t shard_bits_ = 0;
+    // Timestamps handed out never go backwards, even across a re-anchor.
+    std::uint64_t last_timestamp_ns_ = 0;
     std::size_t report_count_ = 0;
     std::size_t market_count_ = 0;
     IdlePolicy idle_ = IdlePolicy::Spin;

@@ -207,6 +207,9 @@ std::size_t Shard::poll(std::size_t max_commands) noexcept {
         ++handled;
     }
     static_cast<void>(try_flush());
+    if (handled == 0) {
+        refresh_clock();
+    }
     return handled;
 }
 
@@ -225,13 +228,11 @@ void Shard::handle(const Command& command) noexcept {
 
     ++stats_.commands;
     // One clock read per command. Every message it causes carries this time.
+    // A re-anchor may move the clock back a little, so clamp: timestamps in
+    // the order of events must never decrease.
+    last_timestamp_ns_ = std::max(last_timestamp_ns_, clock_.now().raw());
     active_ = Active{.ingress_tsc = command.ingress_tsc,
-                     .now_ns = clock_.now().raw(),
-                     .client_order_id = command.id,
-                     .taker_left = command.qty,
-                     .symbol = command.symbol,
-                     .session = command.session,
-                     .accepted = false};
+                     .now_ns = last_timestamp_ns_,
 
     if (command.kind == CommandKind::NewOrder) {
         handle_new(command);
@@ -445,6 +446,14 @@ void Shard::flush_market_blocking() noexcept {
     }
     stats_.stalls += (spins != 0) ? 1U : 0U;
     market_count_ = 0;
+}
+
+void Shard::refresh_clock() noexcept {
+    PLANCK_EXPECT(clock_.calibrated());
+    // Once a second is plenty. The check itself is one counter read.
+    if ((sys::tsc_now() - clock_.anchor_tsc()) > clock_.ticks_per_second()) {
+        clock_.reanchor();
+    }
 }
 
 void Shard::idle() const noexcept {
