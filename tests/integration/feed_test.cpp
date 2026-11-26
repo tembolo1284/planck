@@ -72,6 +72,8 @@ protected:
         publisher_ = std::make_unique<Publisher>();
         ASSERT_EQ(publisher_->init(config), Status::Ok);
         ASSERT_EQ(publisher_->retransmit_endpoint(server_), Status::Ok);
+	tap_messages_ = 0;
+	tap_heartbeats_ = 0;
     }
 
     // Enter `count` resting orders, which produces `count` MdAddOrder events,
@@ -89,21 +91,33 @@ protected:
         }
     }
 
-    // Every datagram waiting on the tap.
+    // Every datagram the publisher has put on the live stream since the last
+    // call. Loopback delivery is quick but not instant, and on a busy machine
+    // it can trail the send by milliseconds. So this does not guess how long
+    // to wait: it reads until the tap has seen every message and heartbeat
+    // the publisher says it has sent.
     std::vector<std::vector<std::byte>> captured() {
+        const auto all_here = [this] {
+            return tap_messages_ == (publisher_->next_sequence(0) - 1) &&
+                   tap_heartbeats_ == publisher_->stats().heartbeats;
+        };
         std::vector<std::vector<std::byte>> datagrams;
         std::array<std::byte, wire::kMaxDatagramSize> buffer{};
-        for (int quiet = 0; quiet < 50;) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!all_here() && std::chrono::steady_clock::now() < deadline) {
             net::Endpoint from;
             const net::IoResult result = tap_.receive_from(buffer, from);
-            if (result.status == Status::Ok) {
-                datagrams.emplace_back(buffer.begin(), buffer.begin() + static_cast<long>(result.bytes));
-                quiet = 0;
-            } else {
-                ++quiet;
-                ::usleep(20);
+            if (result.status != Status::Ok) {
+                ::usleep(50);
+                continue;
             }
+            datagrams.emplace_back(buffer.begin(), buffer.begin() + static_cast<long>(result.bytes));
+            const wire::PacketHeader header = header_of(datagrams.back());
+            tap_messages_ += header.count;
+            tap_heartbeats_ += (header.count == 0) ? 1U : 0U;
         }
+        EXPECT_TRUE(all_here()) << "the tap saw " << tap_messages_ << " messages and "
+                                << tap_heartbeats_ << " heartbeats, fewer than were sent";
         return datagrams;
     }
 
@@ -144,6 +158,8 @@ protected:
     net::Endpoint tap_endpoint_{};
     net::Endpoint server_{};
     std::uint64_t next_id_ = 1;
+    std::uint64_t tap_messages_ = 0;
+    std::uint64_t tap_heartbeats_ = 0;
 };
 
 TEST(PublisherConfigTest, RejectsBadConfigurations) {
@@ -214,12 +230,12 @@ TEST_F(FeedTest, PacksManyMessagesPerDatagramWithoutSplittingAny) {
 
 TEST_F(FeedTest, QuietStreamSendsHeartbeats) {
     PublisherConfig config;
-    config.heartbeat_interval = core::Nanos{2'000'000};
+    config.heartbeat_interval = core::Nanos{100'000'000};
     start(config);
     publish_adds(3);
     static_cast<void>(captured());
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
     static_cast<void>(publisher_->poll());
     // An immediate second pass has not been quiet for long enough to send
     // another one.
@@ -326,7 +342,7 @@ TEST_F(FeedTest, RecoversADatagramLostInTheMiddle) {
 
 TEST_F(FeedTest, HeartbeatRevealsALostFinalDatagram) {
     PublisherConfig config;
-    config.heartbeat_interval = core::Nanos{2'000'000};
+    config.heartbeat_interval = core::Nanos{100'000'000};
     start(config);
     publish_adds(10);
     publish_adds(10);
@@ -341,7 +357,7 @@ TEST_F(FeedTest, HeartbeatRevealsALostFinalDatagram) {
     // tell the subscriber that it is behind.
     EXPECT_FALSE(receiver.recovering());
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
     static_cast<void>(publisher_->poll());
     const auto heartbeat = captured();
     ASSERT_EQ(heartbeat.size(), 1U);
@@ -432,14 +448,70 @@ TEST_F(FeedTest, GivesUpOnAPublisherThatNeverAnswers) {
     EXPECT_TRUE(delivered.sequences.empty());
 }
 
+TEST_F(FeedTest, ListenerThatArrivesLateGetsTheVeryNextDatagram) {
+    // Find a free port, then leave it with nobody listening.
+    net::Endpoint where;
+    {
+        net::Socket probe;
+        ASSERT_EQ(net::udp_open_receiver({net::kLoopback, 0}, probe), Status::Ok);
+        ASSERT_EQ(probe.local_endpoint(where), Status::Ok);
+    }
+    destinations_ = {where};
+    PublisherConfig config;
+    config.shards = pointers_;
+    config.destinations = destinations_;
+    config.retransmit_listen = {net::kLoopback, 0};
+    publisher_ = std::make_unique<Publisher>();
+    ASSERT_EQ(publisher_->init(config), Status::Ok);
+
+    // Three messages go to nobody. The kernel notes, against the publisher's
+    // socket, that the destination refused them.
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        ASSERT_TRUE(shard_->commands().try_push(new_order(1, 3, Side::Buy, 950, 1, next_id_++)));
+    }
+    while (shard_->poll() != 0) {
+    }
+    while (publisher_->poll() != 0) {
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    // Now someone listens. The next datagram must reach them, even though
+    // the socket has an error waiting from before.
+    net::Socket listener;
+    ASSERT_EQ(net::udp_open_receiver(where, listener), Status::Ok);
+    for (std::uint32_t i = 0; i < 2; ++i) {
+        ASSERT_TRUE(shard_->commands().try_push(new_order(1, 3, Side::Buy, 950, 1, next_id_++)));
+    }
+    while (shard_->poll() != 0) {
+    }
+    while (publisher_->poll() != 0) {
+    }
+
+    std::array<std::byte, wire::kMaxDatagramSize> buffer{};
+    net::IoResult got;
+    for (int round = 0; round < 20'000; ++round) {
+        net::Endpoint from;
+        got = listener.receive_from(buffer, from);
+        if (got.status == Status::Ok) {
+            break;
+        }
+        ::usleep(100);
+    }
+    ASSERT_EQ(got.status, Status::Ok) << "the first datagram after the listener arrived was lost";
+    wire::PacketHeader header;
+    std::memcpy(&header, buffer.data(), sizeof(header));
+    EXPECT_EQ(header.sequence, 4U);
+    EXPECT_EQ(header.count, 2);
+}
+
 TEST_F(FeedTest, RetransmitPortRefusesNonsense) {
     PublisherConfig config;
     config.history_messages = 1024;
     start(config);
     for (int batch = 0; batch < 30; ++batch) {
         publish_adds(100);  // 3000 messages: the first ones fall out of history
+        static_cast<void>(captured());
     }
-    static_cast<void>(captured());
 
     net::Socket asker;
     ASSERT_EQ(net::udp_open_receiver({net::kLoopback, 0}, asker), Status::Ok);

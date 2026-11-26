@@ -13,6 +13,7 @@ endif()
 
 option(PLANCK_NATIVE "Tune for the build machine (-march=native)" ON)
 option(PLANCK_BUILD_TESTS "Build the test suite (fetches GoogleTest if not installed)" ON)
+option(PLANCK_BUILD_APPS "Build planckd, planck-client and planck-mdtap" ON)
 set(PLANCK_SANITIZE "" CACHE STRING "Sanitizers to build with, e.g. address,undefined or thread")
 set(PLANCK_CONTRACTS "auto" CACHE STRING "Contract mode: auto, off, assume, checked")
 set_property(CACHE PLANCK_CONTRACTS PROPERTY STRINGS auto off assume checked)
@@ -94,6 +95,10 @@ add_library(planck_engine STATIC
 )
 add_library(planck::engine ALIAS planck_engine)
 target_link_libraries(planck_engine PUBLIC planck_book planck_ring planck_wire)
+
+if(PLANCK_BUILD_APPS)
+    add_subdirectory(apps)
+endif()
 
 if(PLANCK_BUILD_TESTS)
     enable_testing()

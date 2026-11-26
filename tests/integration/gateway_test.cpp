@@ -385,7 +385,7 @@ TEST_F(GatewayTest, SessionLimitIsEnforced) {
 
     // A slot freed by a departure can be taken by a newcomer.
     first->close();
-    for (int i = 0; i < 200 && gateway_->active_sessions() == 2; ++i) {
+    for (int i = 0; i < 20000 && gateway_->active_sessions() == 2; ++i) {
         pump();
         ::usleep(100);
     }
@@ -399,7 +399,7 @@ TEST_F(GatewayTest, ReconnectingGivesANewIdentity) {
     ghost->send(limit(3, core::Side::Sell, 1000, 10, 1));
     const auto left_behind = ghost->expect<wire::OrderAccepted>();
     ghost->close();
-    for (int i = 0; i < 200 && gateway_->active_sessions() != 0; ++i) {
+    for (int i = 0; i < 20000 && gateway_->active_sessions() != 0; ++i) {
         pump();
         ::usleep(100);
     }

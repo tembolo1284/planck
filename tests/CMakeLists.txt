@@ -54,3 +54,16 @@ planck_add_test(planck_integration_tests LABEL integration SOURCES
     integration/full_stack_test.cpp
 )
 
+
+if(TARGET planckd)
+    # Argument parsing and formatting shared by the programs in apps/.
+    planck_add_test(planck_apps_tests LABEL unit SOURCES
+        unit/apps_support_test.cpp
+    )
+    target_link_libraries(planck_apps_tests PRIVATE planck_apps_support)
+
+    # The programs themselves, run as separate processes against each other.
+    add_test(NAME apps_smoke
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/e2e/apps_smoke.sh $<TARGET_FILE_DIR:planckd>)
+    set_tests_properties(apps_smoke PROPERTIES LABELS e2e TIMEOUT 120)
+endif()

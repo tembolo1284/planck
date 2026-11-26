@@ -166,8 +166,16 @@ void Publisher::flush(Stream& stream, const net::Endpoint* to) noexcept {
     std::memcpy(packet_.bytes.data(), &header, sizeof(header));
 
     const std::span<const std::byte> datagram{packet_.bytes.data(), packet_.length};
-    const net::IoResult result =
+    net::IoResult result =
         (to == nullptr) ? stream.socket.send(datagram) : requests_.send_to(datagram, *to);
+    if (to == nullptr && !ok(result.status) && result.status != Status::WouldBlock) {
+        // When a datagram to a plain (not multicast) address finds nobody
+        // listening, the kernel remembers that and fails the next send on
+        // this socket instead of performing it. The failure is about the
+        // earlier datagram, and reporting it clears it. So try this one once
+        // more, or the first message after a listener appears would be lost.
+        result = stream.socket.send(datagram);
+    }
     if (ok(result.status)) {
         ++stats_.datagrams;
     } else {

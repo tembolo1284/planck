@@ -255,16 +255,28 @@ Status udp_open_sender(Endpoint destination, Socket& out, std::uint8_t ttl, bool
     return Status::Ok;
 }
 
+// A socket for receiving on a port. If local.address is a multicast group,
+// the socket joins it, and several receivers on one host may share the group
+// and port. A plain address and port belong to one socket only: a second
+// attempt to bind them fails with Duplicate.
 Status udp_open_receiver(Endpoint local, Socket& out) noexcept {
     Socket socket;
     if (const Status status = open_socket(SOCK_DGRAM, true, socket); !ok(status)) {
         return status;
     }
-    if (const Status status = set_option(socket.fd(), SOL_SOCKET, SO_REUSEADDR, 1); !ok(status)) {
-        return status;
-    }
 
     const bool multicast = is_multicast(local.address);
+    // Sharing a port is the point of multicast: every subscriber on a host
+    // binds the same group and port. For a plain address it is a hazard. Two
+    // UDP sockets that both allow reuse can be given the same port, even by
+    // the kernel when each asked for "any free port", and then one of them
+    // silently gets the other's datagrams.
+    if (multicast) {
+        if (const Status status = set_option(socket.fd(), SOL_SOCKET, SO_REUSEADDR, 1);
+            !ok(status)) {
+            return status;
+        }
+    }
     // A multicast receiver binds to the group address itself, so it does not
     // also pick up unrelated traffic sent to the same port.
     const sockaddr_in address = to_sockaddr(local);

@@ -178,6 +178,33 @@ TEST(Udp, DatagramsArriveWholeWithTheirSender) {
     EXPECT_EQ(text_of({buffer.data(), got.bytes}), "reply");
 }
 
+TEST(Udp, APlainPortBelongsToOneSocket) {
+    Socket first;
+    ASSERT_EQ(udp_open_receiver({kLoopback, 0}, first), Status::Ok);
+    Endpoint where;
+    ASSERT_EQ(first.local_endpoint(where), Status::Ok);
+
+    // If a second socket could bind here, it would take the first one's
+    // datagrams without either of them knowing.
+    Socket second;
+    EXPECT_EQ(udp_open_receiver(where, second), Status::Duplicate);
+    EXPECT_FALSE(second.valid());
+
+    // Once the owner has gone the port is free again at once.
+    first.close();
+    EXPECT_EQ(udp_open_receiver(where, second), Status::Ok);
+}
+
+TEST(Udp, AMulticastGroupCanBeSharedOnOneHost) {
+    const Endpoint group{ipv4(239, 255, 42, 98), 47322};
+    Socket first;
+    if (udp_open_receiver(group, first) != Status::Ok) {
+        GTEST_SKIP() << "cannot join a multicast group here";
+    }
+    Socket second;
+    EXPECT_EQ(udp_open_receiver(group, second), Status::Ok);
+}
+
 TEST(PollerTest, ReportsOnlySocketsWithData) {
     Socket first;
     Socket second;
