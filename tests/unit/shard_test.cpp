@@ -318,6 +318,19 @@ TEST_F(ShardTest, SlowConsumerStallsMatchingAndLosesNothing) {
     }
 }
 
+TEST_F(ShardTest, TimestampsNeverGoBackwards) {
+    // The shard re-anchors its clock to the wall clock when idle, and the
+    // wall clock can be steered backwards. Message timestamps must not follow.
+    std::uint64_t previous = 0;
+    for (int round = 0; round < 200; ++round) {
+        submit(new_order(1, 3, Side::Buy, 950, 1, next_client_id_++, TimeInForce::ImmediateOrCancel));
+        const std::uint64_t timestamp = as<wire::OrderAccepted>(reports_.at(0)).timestamp;
+        ASSERT_GE(timestamp, previous);
+        previous = timestamp;
+        static_cast<void>(shard_->poll());  // an idle pass, which may re-anchor
+    }
+}
+
 TEST_F(ShardTest, CountsWhatItDid) {
     const std::uint64_t id = rest(1, Side::Buy, 1000, 10);
     submit(new_order(2, 3, Side::Sell, 1000, 4, 1));

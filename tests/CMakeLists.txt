@@ -21,7 +21,7 @@ function(planck_add_test name)
     cmake_parse_arguments(ARG "" "LABEL" "SOURCES" ${ARGN})
     add_executable(${name} ${ARG_SOURCES})
     target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(${name} PRIVATE planck::engine GTest::gtest_main)
+    target_link_libraries(${name} PRIVATE planck::gateway planck::feed GTest::gtest_main)
     # A test that hangs is a failed test. Without a timeout CTest waits 25 minutes.
     gtest_discover_tests(${name} PROPERTIES LABELS ${ARG_LABEL} TIMEOUT 120 DISCOVERY_TIMEOUT 60)
 endfunction()
@@ -54,4 +54,3 @@ planck_add_test(planck_integration_tests LABEL integration SOURCES
     integration/full_stack_test.cpp
 )
 
-target_link_libraries(${name} PRIVATE planck::gateway planck::feed GTest::gtest_main)

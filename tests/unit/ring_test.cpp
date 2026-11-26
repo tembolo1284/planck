@@ -82,14 +82,16 @@ TEST_F(RingTest, DrainRespectsItsLimit) {
 }
 
 TEST_F(RingTest, DrainSeesEverythingQueued) {
-    // The consumer keeps a private copy of the producer's index. drain() must
-    // refresh it, or it would return fewer elements than are waiting.
+    // The consumer keeps a private copy of the producer's index and normally
+    // trusts it. Set up the case where that copy is stale but not empty: it
+    // knows about one waiting element when there are really three.
     ASSERT_TRUE(ring_.try_push(1));
-    int value = 0;
-    ASSERT_TRUE(ring_.try_pop(value));
     ASSERT_TRUE(ring_.try_push(2));
+    int value = 0;
+    ASSERT_TRUE(ring_.try_pop(value));  // the copy now says "one more waiting"
     ASSERT_TRUE(ring_.try_push(3));
     ASSERT_TRUE(ring_.try_push(4));
+    // drain() must look again, or it would hand back only the 2.
     EXPECT_EQ(drain_all(), (std::vector<int>{2, 3, 4}));
 }
 

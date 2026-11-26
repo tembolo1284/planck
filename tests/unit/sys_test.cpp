@@ -213,6 +213,23 @@ TEST(Clock, IsAnchoredToTheWallClock) {
         << "TscClock is " << skew << " ns from CLOCK_REALTIME right after calibration";
 }
 
+TEST(Clock, ReanchorKeepsTheRateAndMovesTheAnchor) {
+    TscClock clock;
+    ASSERT_EQ(clock.calibrate(), Status::Ok);
+    const std::uint64_t rate = clock.ticks_per_second();
+    const std::uint64_t first_anchor = clock.anchor_tsc();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    clock.reanchor();
+    EXPECT_EQ(clock.ticks_per_second(), rate);
+    EXPECT_GT(clock.anchor_tsc(), first_anchor);
+
+    const ClockSample wall = sample_wall();
+    const auto skew = static_cast<std::int64_t>(clock.to_wall(wall.tsc).raw()) -
+                      static_cast<std::int64_t>(wall.time.raw());
+    EXPECT_LT(std::llabs(skew), 1'000'000) << "skew right after reanchor: " << skew << " ns";
+}
+
 TEST(Clock, CounterNeverGoesBackwards) {
     std::uint64_t previous = tsc_now();
     for (int i = 0; i < 100'000; ++i) {

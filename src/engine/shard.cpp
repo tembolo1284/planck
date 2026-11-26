@@ -233,6 +233,11 @@ void Shard::handle(const Command& command) noexcept {
     last_timestamp_ns_ = std::max(last_timestamp_ns_, clock_.now().raw());
     active_ = Active{.ingress_tsc = command.ingress_tsc,
                      .now_ns = last_timestamp_ns_,
+                     .client_order_id = command.id,
+                     .taker_left = command.qty,
+                     .symbol = command.symbol,
+                     .session = command.session,
+                     .accepted = false};
 
     if (command.kind == CommandKind::NewOrder) {
         handle_new(command);
