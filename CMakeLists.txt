@@ -12,6 +12,8 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(PLANCK_NATIVE "Tune for the build machine (-march=native)" ON)
+option(PLANCK_BUILD_TESTS "Build the test suite (fetches GoogleTest if not installed)" ON)
+set(PLANCK_SANITIZE "" CACHE STRING "Sanitizers to build with, e.g. address,undefined or thread")
 set(PLANCK_CONTRACTS "auto" CACHE STRING "Contract mode: auto, off, assume, checked")
 set_property(CACHE PLANCK_CONTRACTS PROPERTY STRINGS auto off assume checked)
 
@@ -24,6 +26,11 @@ target_compile_options(planck_flags INTERFACE
 )
 if(PLANCK_NATIVE)
     target_compile_options(planck_flags INTERFACE -march=native)
+endif()
+
+if(PLANCK_SANITIZE)
+    target_compile_options(planck_flags INTERFACE -fsanitize=${PLANCK_SANITIZE} -fno-omit-frame-pointer)
+    target_link_options(planck_flags INTERFACE -fsanitize=${PLANCK_SANITIZE})
 endif()
 
 if(PLANCK_CONTRACTS STREQUAL "off")
@@ -87,3 +94,8 @@ add_library(planck_engine STATIC
 )
 add_library(planck::engine ALIAS planck_engine)
 target_link_libraries(planck_engine PUBLIC planck_book planck_ring planck_wire)
+
+if(PLANCK_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()

@@ -1,0 +1,51 @@
+# Use an installed GoogleTest if there is one, otherwise fetch a pinned release.
+find_package(GTest 1.14 QUIET)
+if(NOT GTest_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        v1.17.0
+        GIT_SHALLOW    TRUE
+        SYSTEM
+    )
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+endif()
+include(GoogleTest)
+
+# planck_add_test(<name> LABEL <label> SOURCES <files...>)
+# Builds one test executable and registers each of its cases with CTest.
+function(planck_add_test name)
+    cmake_parse_arguments(ARG "" "LABEL" "SOURCES" ${ARGN})
+    add_executable(${name} ${ARG_SOURCES})
+    target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(${name} PRIVATE planck::engine GTest::gtest_main)
+    # A test that hangs is a failed test. Without a timeout CTest waits 25 minutes.
+    gtest_discover_tests(${name} PROPERTIES LABELS ${ARG_LABEL} TIMEOUT 120 DISCOVERY_TIMEOUT 60)
+endfunction()
+
+# Fast, deterministic checks of one module at a time.
+planck_add_test(planck_unit_tests LABEL unit SOURCES
+    unit/core_test.cpp
+    unit/sys_test.cpp
+    unit/mem_test.cpp
+    unit/ring_test.cpp
+    unit/ladder_bitmap_test.cpp
+    unit/order_book_test.cpp
+    unit/wire_test.cpp
+    unit/shard_test.cpp
+)
+
+# Randomized checks against an independent model. Scale with PLANCK_TEST_SCALE.
+planck_add_test(planck_property_tests LABEL property SOURCES
+    property/book_differential_test.cpp
+    property/shard_audit_test.cpp
+)
+
+# More than one thread.
+planck_add_test(planck_integration_tests LABEL integration SOURCES
+    integration/ring_stress_test.cpp
+    integration/shard_thread_test.cpp
+)
