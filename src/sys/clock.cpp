@@ -20,6 +20,30 @@ constexpr std::uint64_t kNanosPerSecond = 1'000'000'000;
 // so hitting it means the monotonic clock is not advancing.
 constexpr std::uint32_t kMaxCalibrationSpins = std::uint32_t{1} << 30;
 
+// Attempts per paired sample. One clean attempt is enough, and each costs
+// well under a microsecond, so a handful is plenty to dodge an interruption.
+constexpr int kSampleAttempts = 8;
+
+Nanos read_clock(clockid_t id) noexcept;
+
+ClockSample sample(clockid_t id) noexcept {
+    ClockSample best{};
+    std::uint64_t narrowest = ~std::uint64_t{0};
+    for (int attempt = 0; attempt < kSampleAttempts; ++attempt) {
+        const std::uint64_t before = tsc_now();
+        const Nanos time = read_clock(id);
+        const std::uint64_t after = tsc_now();
+        const std::uint64_t width = after - before;
+        if (after >= before && width < narrowest) {
+            narrowest = width;
+            // The kernel read its clock somewhere inside the bracket. The
+            // midpoint halves the worst-case error.
+            best = ClockSample{.tsc = before + (width / 2), .time = time};
+        }
+    }
+    return best;
+}
+
 Nanos read_clock(clockid_t id) noexcept {
     timespec ts{};
     const int rc = ::clock_gettime(id, &ts);
@@ -58,28 +82,37 @@ Nanos monotonic_now() noexcept {
     return read_clock(CLOCK_MONOTONIC_RAW);
 }
 
+ClockSample sample_monotonic() noexcept {
+    return sample(CLOCK_MONOTONIC_RAW);
+}
+
+ClockSample sample_wall() noexcept {
+    return sample(CLOCK_REALTIME);
+}
+
 Status TscClock::calibrate(Nanos window) noexcept {
     if (window < kMinWindow || window > kMaxWindow) {
         return Status::InvalidArgument;
     }
 
-    const std::uint64_t start_ns = monotonic_now().raw();
-    const std::uint64_t start_tsc = tsc_now();
-    std::uint64_t end_ns = start_ns;
+    // Both ends of the window are paired samples, so a pause between reading
+    // the kernel clock and reading the counter cannot skew the measured rate.
+    const ClockSample start = sample_monotonic();
+    std::uint64_t now_ns = start.time.raw();
     std::uint32_t spins = 0;
-    while ((end_ns - start_ns) < window.raw() && spins < kMaxCalibrationSpins) {
+    while ((now_ns - start.time.raw()) < window.raw() && spins < kMaxCalibrationSpins) {
         core::cpu_relax();
-        end_ns = monotonic_now().raw();
+        now_ns = monotonic_now().raw();
         ++spins;
     }
-    const std::uint64_t end_tsc = tsc_now();
+    const ClockSample end = sample_monotonic();
 
-    if ((end_ns - start_ns) < window.raw() || end_tsc <= start_tsc) {
+    if (end.time < start.time || (end.time - start.time) < window || end.tsc <= start.tsc) {
         return Status::Io;
     }
 
-    const std::uint64_t elapsed_ns = end_ns - start_ns;
-    const std::uint64_t elapsed_ticks = end_tsc - start_tsc;
+    const std::uint64_t elapsed_ns = (end.time - start.time).raw();
+    const std::uint64_t elapsed_ticks = end.tsc - start.tsc;
     const detail::U128 mult = (static_cast<detail::U128>(elapsed_ns) << kShift) / elapsed_ticks;
     const detail::U128 rate =
         (static_cast<detail::U128>(elapsed_ticks) * kNanosPerSecond) / elapsed_ns;
@@ -87,19 +120,13 @@ Status TscClock::calibrate(Nanos window) noexcept {
         return Status::OutOfRange;
     }
 
-    // Anchor to the wall clock. Read the counter between two wall readings
-    // and use their midpoint, which halves the error from the read latency.
-    const std::uint64_t wall_before = wall_now().raw();
-    const std::uint64_t anchor_tsc = tsc_now();
-    const std::uint64_t wall_after = wall_now().raw();
-    if (wall_after < wall_before) {
-        return Status::Io;
-    }
+    // Anchor to the wall clock at one instant.
+    const ClockSample anchor = sample_wall();
 
     mult_ = static_cast<std::uint64_t>(mult);
     ticks_per_second_ = static_cast<std::uint64_t>(rate);
-    base_tsc_ = anchor_tsc;
-    base_wall_ = Nanos{wall_before + ((wall_after - wall_before) / 2)};
+    base_tsc_ = anchor.tsc;
+    base_wall_ = anchor.time;
 
     PLANCK_ENSURE(calibrated());
     return Status::Ok;

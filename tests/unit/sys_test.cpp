@@ -167,26 +167,50 @@ TEST(Clock, RejectsBadCalibrationWindow) {
     EXPECT_FALSE(clock.calibrated());
 }
 
-TEST(Clock, AgreesWithTheKernelClock) {
+TEST(Clock, PairedSampleIsTight) {
+    const ClockSample first = sample_monotonic();
+    const ClockSample second = sample_monotonic();
+    EXPECT_GT(first.tsc, 0U);
+    EXPECT_GE(second.tsc, first.tsc);
+    EXPECT_GE(second.time, first.time);
+    EXPECT_GT(sample_wall().time.raw(), 1'600'000'000ULL * 1'000'000'000ULL) << "not a wall-clock time";
+}
+
+// The calibrated rate, checked against the same clock it was calibrated
+// from. Timing tests are fragile on a busy machine, so both ends of the
+// interval are paired samples and the failure message carries every number
+// needed to see what went wrong.
+TEST(Clock, MeasuresIntervalsLikeTheKernelClock) {
     TscClock clock;
     ASSERT_EQ(clock.calibrate(), Status::Ok);
     ASSERT_TRUE(clock.calibrated());
     EXPECT_GT(clock.ticks_per_second(), 1'000'000U);
 
-    const core::Nanos mono_start = monotonic_now();
-    const std::uint64_t tsc_start = tsc_now();
+    const ClockSample start = sample_monotonic();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    const std::uint64_t tsc_end = tsc_now_serialized();
-    const core::Nanos mono_end = monotonic_now();
+    const ClockSample end = sample_monotonic();
 
-    const double measured = static_cast<double>(clock.to_nanos(tsc_end - tsc_start).raw());
-    const double expected = static_cast<double>((mono_end - mono_start).raw());
-    // Generous: this runs on shared CI machines. A healthy box is within 50 ppm.
-    EXPECT_NEAR(measured / expected, 1.0, 0.01);
+    const double measured = static_cast<double>(clock.to_nanos(end.tsc - start.tsc).raw());
+    const double expected = static_cast<double>((end.time - start.time).raw());
+    // Generous on purpose. A healthy machine is within 50 parts per million.
+    EXPECT_NEAR(measured / expected, 1.0, 0.01)
+        << "counter says " << measured << " ns, kernel says " << expected << " ns"
+        << ", calibrated at " << clock.ticks_per_second() << " ticks/s"
+        << ", invariant counter: " << (tsc_is_invariant() ? "yes" : "no");
+}
 
-    const auto skew = static_cast<std::int64_t>(clock.now().raw()) -
-                      static_cast<std::int64_t>(wall_now().raw());
-    EXPECT_LT(std::llabs(skew), 5'000'000) << "TscClock::now() is more than 5 ms from the wall clock";
+// The wall-clock anchor, checked the moment it is set. Checking it later
+// would also measure how hard the system is steering CLOCK_REALTIME, which
+// is not what this test is about.
+TEST(Clock, IsAnchoredToTheWallClock) {
+    TscClock clock;
+    ASSERT_EQ(clock.calibrate(), Status::Ok);
+
+    const ClockSample wall = sample_wall();
+    const auto skew = static_cast<std::int64_t>(clock.to_wall(wall.tsc).raw()) -
+                      static_cast<std::int64_t>(wall.time.raw());
+    EXPECT_LT(std::llabs(skew), 1'000'000)
+        << "TscClock is " << skew << " ns from CLOCK_REALTIME right after calibration";
 }
 
 TEST(Clock, CounterNeverGoesBackwards) {

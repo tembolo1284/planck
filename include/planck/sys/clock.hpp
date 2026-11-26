@@ -56,6 +56,21 @@ __extension__ typedef unsigned __int128 U128;
 // and is not slewed.
 [[nodiscard]] core::Nanos monotonic_now() noexcept;
 
+// A cycle counter reading and a kernel clock reading that describe the same
+// instant.
+struct ClockSample {
+    std::uint64_t tsc = 0;
+    core::Nanos time{};
+};
+
+// Read the cycle counter and a kernel clock as one instant. Two separate
+// calls cannot do that: the scheduler or a hypervisor can pause the thread
+// between them, and the two readings then disagree by however long the pause
+// was. These read the counter on both sides of the kernel clock, repeat a
+// few times, and keep the attempt with the narrowest bracket.
+[[nodiscard]] ClockSample sample_monotonic() noexcept;
+[[nodiscard]] ClockSample sample_wall() noexcept;
+
 // Converts cycle counts to nanoseconds. Calibrate once at startup, then copy
 // freely: after calibration the object is immutable and safe to read from
 // any thread.
