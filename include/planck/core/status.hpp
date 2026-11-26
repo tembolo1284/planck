@@ -22,9 +22,10 @@ enum class [[nodiscard]] Status : std::uint8_t {
     Io,
     Protocol,
     Unsupported,
+    Permission,
 };
 
-inline constexpr std::size_t kStatusCount = 11;
+inline constexpr std::size_t kStatusCount = 12;
 
 [[nodiscard]] constexpr bool ok(Status status) noexcept {
     return status == Status::Ok;

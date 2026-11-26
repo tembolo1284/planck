@@ -43,3 +43,41 @@ add_library(planck_core STATIC
 add_library(planck::core ALIAS planck_core)
 target_include_directories(planck_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(planck_core PUBLIC planck_flags)
+
+find_package(Threads REQUIRED)
+
+add_library(planck_sys STATIC
+    src/sys/clock.cpp
+    src/sys/cpu.cpp
+    src/sys/error.cpp
+    src/sys/memory.cpp
+)
+add_library(planck::sys ALIAS planck_sys)
+target_link_libraries(planck_sys PUBLIC planck_core Threads::Threads)
+
+add_library(planck_mem STATIC
+    src/mem/arena.cpp
+)
+add_library(planck::mem ALIAS planck_mem)
+target_link_libraries(planck_mem PUBLIC planck_sys)
+
+add_library(planck_book STATIC
+    src/book/ladder_bitmap.cpp
+    src/book/order_book.cpp
+    src/book/order_store.cpp
+    src/book/types.cpp
+)
+add_library(planck::book ALIAS planck_book)
+target_link_libraries(planck_book PUBLIC planck_mem)
+
+# Header only.
+add_library(planck_ring INTERFACE)
+add_library(planck::ring ALIAS planck_ring)
+target_link_libraries(planck_ring INTERFACE planck_mem)
+
+add_library(planck_wire STATIC
+    src/wire/codec.cpp
+    src/wire/types.cpp
+)
+add_library(planck::wire ALIAS planck_wire)
+target_link_libraries(planck_wire PUBLIC planck_core)

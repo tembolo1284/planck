@@ -9,12 +9,12 @@ namespace {
 
 constexpr std::array<std::string_view, kStatusCount> kStatusNames{
     "Ok",       "InvalidArgument", "OutOfRange", "Capacity", "NotFound",    "Duplicate",
-    "WouldBlock", "Closed",        "Io",         "Protocol", "Unsupported",
+    "WouldBlock", "Closed",        "Io",         "Protocol", "Unsupported", "Permission",
 };
 
-static_assert(std::to_underlying(Status::Unsupported) + 1 == kStatusCount);
+static_assert(std::to_underlying(Status::Permission) + 1 == kStatusCount);
 static_assert(kStatusNames[std::to_underlying(Status::Ok)] == "Ok");
-static_assert(kStatusNames[std::to_underlying(Status::Unsupported)] == "Unsupported");
+static_assert(kStatusNames[std::to_underlying(Status::Permission)] == "Permission");
 
 }  // namespace
 
