@@ -14,6 +14,7 @@
 #include "planck/mem/arena.hpp"
 #include "planck/net/poller.hpp"
 #include "planck/net/socket.hpp"
+#include "planck/perf/histogram.hpp"
 #include "planck/wire/codec.hpp"
 
 namespace planck::gateway {
@@ -39,6 +40,17 @@ struct GatewayConfig {
     // Outbound bytes a client may have queued before it is judged too slow
     // and disconnected.
     std::uint32_t tx_buffer_bytes = 64U << 10;
+
+    // The first session id to hand out. After a restart from a journal this
+    // must be above every id the journal mentions, because resting orders
+    // still carry their old owner's id.
+    std::uint32_t first_session_id = 1;
+
+    // If set, the gateway records here how long each report took: from the
+    // moment its request came off the socket to the moment the gateway
+    // picked the report up to send. In ticks of the cycle counter. Only the
+    // gateway thread may touch the histogram while the gateway runs.
+    perf::Histogram* latency = nullptr;
 
     bool pin = false;
     std::size_t cpu = 0;
@@ -169,6 +181,7 @@ private:
     net::Poller poller_{};
     std::span<engine::Shard* const> shards_{};
     std::uint32_t next_session_id_ = 1;
+    perf::Histogram* latency_ = nullptr;
     std::uint32_t active_ = 0;
     std::uint32_t max_sessions_ = 0;
     std::uint32_t tx_capacity_ = 0;

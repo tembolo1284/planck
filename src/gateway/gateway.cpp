@@ -30,6 +30,9 @@ Status validate(const GatewayConfig& config) noexcept {
     if (config.tx_buffer_bytes < wire::kMaxMessageSize || config.tx_buffer_bytes > (16U << 20)) {
         return Status::InvalidArgument;
     }
+    if (config.first_session_id == 0) {
+        return Status::InvalidArgument;
+    }
     return Status::Ok;
 }
 
@@ -103,6 +106,8 @@ Status Gateway::init(const GatewayConfig& config) noexcept {
 
     shards_ = config.shards;
     max_sessions_ = config.max_sessions;
+    next_session_id_ = config.first_session_id;
+    latency_ = config.latency;
     tx_capacity_ = config.tx_buffer_bytes;
     idle_ = config.idle;
     listener_ = std::move(listener);
@@ -389,7 +394,12 @@ void Gateway::reject_cancel(Session& session, std::uint64_t order_id,
 std::size_t Gateway::route_reports() noexcept {
     std::size_t routed = 0;
     for (engine::Shard* const shard : shards_) {
-        routed += shard->reports().drain(kMaxReportsPerShard, [this](const engine::Report& r) noexcept {
+        // One counter read per batch. Every report in it is picked up now.
+        const std::uint64_t now_tsc = (latency_ != nullptr) ? sys::tsc_now() : 0;
+        routed += shard->reports().drain(kMaxReportsPerShard, [this, now_tsc](const engine::Report& r) noexcept {
+            if (latency_ != nullptr && r.ingress_tsc != 0 && now_tsc >= r.ingress_tsc) {
+                latency_->record(now_tsc - r.ingress_tsc);
+            }
             Session* const session = find(r.session);
             if (session == nullptr || !session->logged_in) {
                 // The client left while its order was still working.

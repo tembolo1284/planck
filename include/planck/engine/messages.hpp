@@ -62,6 +62,20 @@ static_assert(std::is_trivially_copyable_v<Command>);
                    .kind = CommandKind::CancelOrder};
 }
 
+// A command exactly as a shard carried it out, for the journal. Replaying
+// these in order into an empty shard rebuilds its books and its market data
+// stream, byte for byte. 48 bytes.
+struct JournalEntry {
+    // Counts every command the shard has handled, from 1, with no gaps.
+    std::uint64_t sequence = 0;
+    // The time the shard stamped on every message this command caused.
+    std::uint64_t timestamp_ns = 0;
+    Command command{};
+};
+
+static_assert(sizeof(JournalEntry) == 48);
+static_assert(std::is_trivially_copyable_v<JournalEntry>);
+
 // A message for one order entry session. The shard has already encoded it:
 // bytes[0, length) is a complete wire message, and the gateway only has to
 // copy it to the right socket. 64 bytes: one cache line.
