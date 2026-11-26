@@ -37,9 +37,20 @@ means a real operational gap. **low** means a rough edge.
 
 | Id | Severity | Weakness | Why it matters | Fix |
 |----|----------|----------|----------------|-----|
-| W-20 | high | Nothing is persisted. A restart loses every resting order and all sequence state. | No recovery after a crash. | `journal/`. |
 | W-21 | medium | A shard that cannot hand off its output stalls, and aborts the process after 2^34 spins. | One dead consumer takes the shard down with it. That is deliberate (it never drops a message), but there is no softer path. | Detect a dead consumer sooner and fail over, or shut down cleanly with a clear message. |
 | W-22 | low | Limits are compile-time constants: 16 shards, 4096 symbols, 1024 session slots. Order capacity and price bands are fixed at start. | Changing any of them means a rebuild or a restart. | Fine for now. List them in the README. |
+
+## Journal
+
+| Id | Severity | Weakness | Why it matters | Fix |
+|----|----------|----------|----------------|-----|
+| W-70 | high | A command is answered before it is on disk. If the machine loses power, up to `--journal-sync` milliseconds of commands (10 by default) are gone, although clients were told they happened and the feed published them. | After such a restart the venue's books disagree with what clients and subscribers believe. A plain process crash loses nothing. | Depends on D-12. Hold reports until the sync that covers them, or replicate to a second machine. |
+| W-71 | high | If the disk fails or fills, the recorder stops writing and matching carries on. `planckd` prints one line to stderr. | From that moment a restart loses everything after the failure, and nobody may have noticed. | Depends on D-13. |
+| W-72 | medium | The journal grows without limit, 48 bytes a command, and a restart replays all of it. There are no snapshots and no rotation. | A long-running venue has a slow restart and an ever larger file. | Snapshot the books at a sequence number, start a new file there, replay only what follows. Shares its design with W-10. |
+| W-73 | medium | Restart republishes the whole market data stream from sequence 1. Subscribers that kept running ignore what they have already seen, which works, but only because replay is exact. | A burst of old data at every restart, growing with the journal. | Goes away with snapshots (W-72). |
+| W-74 | medium | A journal can only be replayed into the same configuration: shard count, symbols, bands and order capacity. Anything else is refused. | Adding a symbol or raising a limit means throwing the journal away. | A migration tool, or a configuration record inside the journal so the venue can rebuild with the old settings and then change. |
+| W-75 | low | One recorder thread writes every shard's file, to one directory, with ordinary buffered writes. | With many busy shards the recorder, not the disk, becomes the limit, and a shard that outruns it stalls. | One recorder per disk, and preallocated files. Measure first. |
+| W-76 | low | Session ids restart above the highest one in the journal, so the 65,535 limit (W-02) now spans every restart. | A venue with a long journal runs out sooner. | Fixed by the fix for W-02. |
 
 ## Clock
 
@@ -57,7 +68,8 @@ means a real operational gap. **low** means a rough edge.
 | W-62 | low | `planck-mdtap` prints events and does not rebuild books. There is no top-of-book view. | It cannot show that the feed alone is enough to hold a book. Only the tests prove that. | Add a `--book` mode with a fixed-size order table. |
 | W-63 | low | `planck-client` sends one request and waits for its answer before the next. | It cannot generate load. | That is the job of `bench/`. Keep the client simple. |
 | W-64 | low | `planckd` counters reach the printout up to 1024 loop passes late, and only when asked with `--stats`. There is no log file and no way to query a running venue. | Little visibility in operation. | A stats socket or a shared-memory page, once `perf/` exists. |
-| W-65 | low | `planck-replay` does not exist. | Nothing can replay a session. | Needs `journal/` first. |
+| W-65 | low | `planck-replay` checks and prints a journal. It does not rebuild books from one or compare two runs. | Looking into a journal by hand is the only offline tool. | Add a mode that replays into a shard and prints the resulting books. |
+| W-66 | low | The latency `planckd` prints covers request off the socket to report picked up for sending. It leaves out the kernel's network stack on both sides and the final `send()`. | It understates what a client sees. | `bench/` will measure from the client's side. Hardware timestamps for the rest. |
 
 ## Not tested
 
@@ -71,16 +83,19 @@ means a real operational gap. **low** means a rough edge.
 | W-45 | Packet loss, reordering and duplication from a real network. Tests drop whole datagrams by hand. |
 | W-46 | The timestamp clamp when the wall clock really steps backwards. |
 | W-47 | AArch64. The code has paths for it and none has been compiled. |
-| W-48 | The net, gateway and feed modules, and the programs in `apps/`, under GCC 16. They were developed with GCC 13 and Clang 18. |
+| W-48 | The `journal/` and `perf/` modules, and the journaling changes to the shard, gateway and `planckd`, under GCC 16. They were developed with GCC 13 and Clang 18. Whether the full test suite passes on GCC 16 for `net/`, `gateway/` and `feed/` has also not been reported, only that the programs build and trade. |
 | W-49 | `planckd` with `--cpus`, `--lock-memory`, `--huge require` or `--idle spin`. The end-to-end test runs unpinned on loopback, and the development sandbox has two CPUs. |
 | W-52 | `planck-client` typed at from a terminal. Every run so far fed it a script through a pipe. |
+| W-55 | A journal after real power loss. Torn and damaged files are made by hand in the tests. Killing the process is tested, and loses nothing. |
+| W-56 | The recorder when the disk fills or fails. The code path that sets `failed()` has never run. |
+| W-57 | The journal and recorder with more than two shards, or on a slow disk. |
 | W-53 | The three programs talking over multicast inside the automated test. It was done once by hand. The end-to-end test uses plain loopback addresses so it passes on hosts without multicast. |
 
 ## Measurement
 
 | Id | Severity | Weakness | Fix |
 |----|----------|----------|-----|
-| W-50 | high | There are no latency numbers at all. The project's one-line claim is nanosecond tail latency and nothing yet measures it. | `perf/` and `bench/`. |
+| W-50 | high | There are no trustworthy latency numbers. `planckd --stats` now prints percentiles, but nothing has been measured on pinned, isolated cores, and the journal's cost to the shard is unmeasured. The project's one-line claim is nanosecond tail latency. | `bench/`, on real hardware. |
 | W-54 | low | The end-to-end test picks its four ports from its process id, in the range 12000 to 28000. Another program already on one of them makes the test fail. | Let the programs bind port 0 and report what they got, then have the script read it. |
 | W-51 | medium | The seeded-bug check (plant a bug, confirm a test fails) is a throwaway script outside the repo. An earlier version of it gave false passes. | Put a proper version in `tools/` and run it before each milestone. |
 
@@ -94,3 +109,6 @@ means a real operational gap. **low** means a rough edge.
 | F-04 | 2026-11 | Feed and gateway tests assumed loopback delivery within a few milliseconds. One failed under load. | The feed tests now wait until the tap has seen every message the publisher counted as sent. Heartbeat tests use a 100 ms interval. Gateway tests wait up to several seconds for a disconnect to be noticed. |
 | F-05 | 2026-11 | With a plain (not multicast) feed address, the first datagram sent after a period with no listener was silently dropped. The kernel reports the earlier "nobody there" on the next send and does not perform that send. | The publisher retries a failed live send once. `FeedTest.ListenerThatArrivesLateGetsTheVeryNextDatagram` covers it. Found by the end-to-end test under load. |
 | F-06 | 2026-11 | Every UDP receiver allowed port reuse. The kernel can give two such sockets the same port, even when each asked for any free one, and one then takes the other's datagrams. Tests running side by side lost whole streams this way, and so could a subscriber's retransmit replies. | Only multicast receivers allow reuse now. A plain address and port can be bound once. `Udp.APlainPortBelongsToOneSocket` covers it. Found by repeated parallel test runs. |
+| F-07 | 2026-11 | Nothing was persisted. A restart lost every resting order. (Was W-20.) | `journal/`: every command is recorded, and `planckd --journal` rebuilds the books and the market data stream from it at startup. |
+| F-08 | 2026-11 | After a restart a new session could have been given the id of an old one and inherited its resting orders. | The gateway starts its session ids above the highest in the journal. |
+| F-09 | 2026-11 | GCC 16 had not built `net/`, `gateway/`, `feed/` or `apps/`. (Was part of W-48.) | Built and run by hand on GCC 16.0.1 under WSL2: two clients traded through `planckd` and the counters matched. |

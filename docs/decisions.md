@@ -53,9 +53,35 @@ Things that are simply broken or missing live in `weaknesses.md`.
 - **Alternative:** discipline the rate continuously against the wall clock, or stamp with a hardware clock.
 - **Leaning:** keep. Revisit once W-30 is understood.
 
-### D-09 Order of the remaining work
-- **Original plan:** `journal/`, `perf/`, `capi/`, `apps/`, `bench/`, then `tools/`, `scripts/`, `docs/`, presets and README.
-- **Proposed:** `apps/` first, so there is a venue to start and poke at, then the rest in the original order.
+### D-10 How the venue learns its symbols
+- **Today:** `planckd --symbols N` makes symbols 1 to N, all with the same price band, and puts symbol S on shard S mod the shard count.
+- **Alternative:** a config file with one line per symbol: id, name, band, shard.
+- **Leaning:** the config file, written when `journal/` is done, since the journal will want to record the same table.
+- **Touches:** W-60.
+
+### D-11 What an unpinned venue does when idle
+- **Today:** without `--cpus`, every thread sleeps 50 microseconds when it has nothing to do. A request crosses three such threads, so a round trip costs a few hundred microseconds. With `--cpus` the threads spin.
+- **Alternative:** yield, which is faster but keeps every thread at 100 percent of a core.
+- **Leaning:** keep. An unpinned venue is for development, and `--idle yield` or `--idle spin` is one flag away.
+
+### D-12 When a command counts as durable
+- **Today:** asynchronous. The shard answers at once, and a recorder thread writes the journal behind it, forcing the disk every 10 ms by default. The matching thread never waits for a disk.
+- **Alternative A:** group commit. Hold each report until the sync that covers its command. Nothing a client was told can be lost, at the cost of adding the sync time to every order.
+- **Alternative B:** replicate each command to a second machine before answering, and keep the disk asynchronous. This is what most fast venues do.
+- **Leaning:** keep asynchronous as the default, and add A as a switch for anyone who wants it. B is a project of its own.
+- **Touches:** W-70.
+
+### D-13 What the venue does when its journal fails
+- **Today:** matching carries on and `planckd` prints an error. The journal stops describing the venue.
+- **Alternative:** stop taking orders the moment the journal fails, and reject new ones with a reason.
+- **Leaning:** the alternative. A venue that cannot record what it does should not be doing it. Left as it is for now because rejecting needs a path from the recorder back to the gateway.
+- **Touches:** W-71.
+
+### D-14 How replay treats sessions
+- **Today:** replay rebuilds books and market data and tells no session anything. Orders from before the restart rest with no owner able to cancel them, exactly like orders left by a disconnect.
+- **Alternative:** cancel every resting order at restart, which many venues do, or let clients reclaim their orders after logging in again.
+- **Leaning:** settle together with D-01. They are the same question.
+- **Touches:** W-01.
 
 ## Settled
 
@@ -71,3 +97,6 @@ Things that are simply broken or missing live in `weaknesses.md`.
 | S-08 | Order entry over TCP with fixed-layout little-endian binary messages. Market data over UDP multicast with per-stream sequence numbers. | TCP for reliability where each message matters to one party. UDP for fan-out. |
 | S-09 | Wire structs are checked once, at the gateway. Nothing past that point re-validates them. | One trust boundary. |
 | S-10 | Classic `#ifndef` include guards. CMake with Ninja. GoogleTest. | House style. |
+| S-11 | `apps/` before `journal/`, `perf/`, `capi/` and `bench/`. | A venue that can be started and poked at makes everything after it easier to check. |
+| S-12 | The journal records commands, not their effects, and the shard writes it, not the gateway. | Matching is deterministic, so the inputs are enough to rebuild everything, and only the shard knows the order it handled them in and the time it gave each. |
+| S-13 | A torn record at the end of a journal is dropped at restart. Damage anywhere else stops the venue from starting. | The first is the normal mark of a crash. The second means history is missing, and a person should decide. |

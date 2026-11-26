@@ -46,6 +46,10 @@ struct ShardConfig {
     std::uint32_t command_ring_capacity = 1U << 16;
     std::uint32_t report_ring_capacity = 1U << 16;
     std::uint32_t market_ring_capacity = 1U << 16;
+    // Zero turns journaling off. Otherwise a power of two: the shard then
+    // puts a JournalEntry on journal() for every command it handles, and
+    // something must drain that ring or the shard will stall.
+    std::uint32_t journal_ring_capacity = 0;
     sys::HugePages huge_pages = sys::HugePages::Try;
 
     // Thread placement. With pin off, the other three are ignored.
@@ -71,10 +75,11 @@ struct ShardStats {
 };
 
 // One matching thread and everything it owns: the order store, the books for
-// its symbols, and three rings.
+// its symbols, and its rings.
 //
 //   gateway --commands--> [ shard ] --reports--> gateway   (per session)
 //                                   --market---> feed      (public)
+//                                   --journal--> recorder  (optional)
 //
 // No lock and no atomic sits between a command and its book. Other threads
 // touch a shard only through the rings.
@@ -87,6 +92,7 @@ public:
     using CommandRing = ring::SpscRing<Command>;
     using ReportRing = ring::SpscRing<Report>;
     using MarketRing = ring::SpscRing<MarketEvent>;
+    using JournalRing = ring::SpscRing<JournalEntry>;
 
     // Messages from one command are collected here and published together.
     static constexpr std::size_t kStageCapacity = 128;
@@ -115,11 +121,29 @@ public:
     // Call poll() until stop becomes true. Idles as the config says.
     void run(const std::atomic<bool>& stop) noexcept;
 
+    // Carry out one command read back from a journal, stamped with the time
+    // it was given the first time. For rebuilding state after a restart,
+    // before the shard goes live. Market data is published as usual, so a
+    // feed sees the same stream again. Nothing is reported to sessions,
+    // which no longer exist, and nothing is journaled a second time.
+    //
+    // Returns false, having done nothing, if output from an earlier command
+    // is still waiting for room in a ring. Let the consumers run and call
+    // again. Only the shard's own thread may call this, and never while a
+    // gateway is feeding commands().
+    [[nodiscard]] bool try_replay(const Command& command, std::uint64_t timestamp_ns) noexcept;
+
     // The gateway is the only producer on commands() and the only consumer
     // on reports(). The feed is the only consumer on market().
     [[nodiscard]] CommandRing& commands() noexcept { return commands_; }
     [[nodiscard]] ReportRing& reports() noexcept { return reports_; }
     [[nodiscard]] MarketRing& market() noexcept { return market_; }
+    // The journal recorder is the only consumer on journal().
+    [[nodiscard]] JournalRing& journal() noexcept { return journal_; }
+    [[nodiscard]] bool journaling() const noexcept { return journaling_; }
+    // How many commands this shard has handled, replayed ones included. The
+    // next JournalEntry will carry this plus one.
+    [[nodiscard]] std::uint64_t sequence() const noexcept { return sequence_; }
 
     // A symbol's book, or nullptr if this shard does not trade it. Only the
     // shard thread may read a book while the shard is running.
@@ -160,7 +184,8 @@ private:
         return (index == kNoBook) ? nullptr : (books_ + index);
     }
 
-    void handle(const Command& command) noexcept;
+    // forced_timestamp_ns of zero means "read the clock".
+    void handle(const Command& command, std::uint64_t forced_timestamp_ns) noexcept;
     void handle_new(const Command& command) noexcept;
     void handle_cancel(const Command& command) noexcept;
     void on_trade(const book::Trade& trade) noexcept;
@@ -175,8 +200,8 @@ private:
     // while. Called only when there is no work waiting.
     void refresh_clock() noexcept;
 
-    // Move staged messages into the rings if there is room. True if both
-    // stages are now empty.
+    // Move staged messages into the rings if there is room. True if nothing
+    // is left waiting.
     [[nodiscard]] bool try_flush() noexcept;
     void flush_reports_blocking() noexcept;
     void flush_market_blocking() noexcept;
@@ -189,6 +214,14 @@ private:
     std::uint64_t shard_bits_ = 0;
     // Timestamps handed out never go backwards, even across a re-anchor.
     std::uint64_t last_timestamp_ns_ = 0;
+    std::uint64_t sequence_ = 0;
+    bool journaling_ = false;
+    // True while try_replay() is handling a command.
+    bool replaying_ = false;
+    // One command makes one journal entry, and the next command is not
+    // taken until it has gone out, so a stage of one is enough.
+    bool journal_pending_ = false;
+    JournalEntry journal_entry_{};
     std::size_t report_count_ = 0;
     std::size_t market_count_ = 0;
     IdlePolicy idle_ = IdlePolicy::Spin;
@@ -199,6 +232,7 @@ private:
     CommandRing commands_{};
     ReportRing reports_{};
     MarketRing market_{};
+    JournalRing journal_{};
 
     std::array<std::uint16_t, core::kMaxSymbols> book_index_{};
     std::array<Report, kStageCapacity> report_stage_{};

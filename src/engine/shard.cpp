@@ -62,6 +62,9 @@ Status validate(const ShardConfig& config) noexcept {
         !valid_ring_size(config.market_ring_capacity, Shard::kStageCapacity)) {
         return Status::InvalidArgument;
     }
+    if (config.journal_ring_capacity != 0 && !valid_ring_size(config.journal_ring_capacity, 2)) {
+        return Status::InvalidArgument;
+    }
     return Status::Ok;
 }
 
@@ -73,6 +76,7 @@ std::size_t arena_bytes(const ShardConfig& config) noexcept {
     total += std::size_t{config.command_ring_capacity} * sizeof(Command);
     total += std::size_t{config.report_ring_capacity} * sizeof(Report);
     total += std::size_t{config.market_ring_capacity} * sizeof(MarketEvent);
+    total += std::size_t{config.journal_ring_capacity} * sizeof(JournalEntry);
     total += config.symbols.size() * sizeof(book::OrderBook);
     for (const SymbolConfig& symbol : config.symbols) {
         // One Level per tick, plus one bit per tick in each of two bitmaps.
@@ -149,6 +153,16 @@ Status Shard::init_memory(const ShardConfig& config) noexcept {
     if (const Status status = reports_.init(reports); !ok(status)) {
         return status;
     }
+    if (config.journal_ring_capacity != 0) {
+        const auto journal = arena_.allocate_array<JournalEntry>(config.journal_ring_capacity);
+        if (journal.empty()) {
+            return Status::Capacity;
+        }
+        if (const Status status = journal_.init(journal); !ok(status)) {
+            return status;
+        }
+        journaling_ = true;
+    }
     return market_.init(market);
 }
 
@@ -203,7 +217,7 @@ std::size_t Shard::poll(std::size_t max_commands) noexcept {
         if (!commands_.try_pop(command)) {
             break;
         }
-        handle(command);
+        handle(command, 0);
         ++handled;
     }
     static_cast<void>(try_flush());
@@ -223,14 +237,37 @@ void Shard::run(const std::atomic<bool>& stop) noexcept {
     }
 }
 
-void Shard::handle(const Command& command) noexcept {
-    PLANCK_EXPECT(report_count_ == 0 && market_count_ == 0);
+bool Shard::try_replay(const Command& command, std::uint64_t timestamp_ns) noexcept {
+    PLANCK_EXPECT(initialised());
+    PLANCK_EXPECT(timestamp_ns != 0);
+    if (!try_flush()) {
+        ++stats_.stalls;
+        return false;
+    }
+    replaying_ = true;
+    handle(command, timestamp_ns);
+    replaying_ = false;
+    static_cast<void>(try_flush());
+    return true;
+}
+
+void Shard::handle(const Command& command, std::uint64_t forced_timestamp_ns) noexcept {
+    PLANCK_EXPECT(report_count_ == 0 && market_count_ == 0 && !journal_pending_);
 
     ++stats_.commands;
+    ++sequence_;
     // One clock read per command. Every message it causes carries this time.
     // A re-anchor may move the clock back a little, so clamp: timestamps in
-    // the order of events must never decrease.
-    last_timestamp_ns_ = std::max(last_timestamp_ns_, clock_.now().raw());
+    // the order of events must never decrease. A replayed command carries
+    // the time it was given the first time round.
+    const std::uint64_t now =
+        (forced_timestamp_ns != 0) ? forced_timestamp_ns : clock_.now().raw();
+    last_timestamp_ns_ = std::max(last_timestamp_ns_, now);
+    if (journaling_ && !replaying_) {
+        journal_entry_ = JournalEntry{
+            .sequence = sequence_, .timestamp_ns = last_timestamp_ns_, .command = command};
+        journal_pending_ = true;
+    }
     active_ = Active{.ingress_tsc = command.ingress_tsc,
                      .now_ns = last_timestamp_ns_,
                      .client_order_id = command.id,
@@ -390,6 +427,9 @@ void Shard::emit_accepted(core::OrderId id) noexcept {
 
 template <wire::Message T>
 void Shard::report(core::SessionId session, const T& message) noexcept {
+    if (replaying_) [[unlikely]] {
+        return;  // the session this was for ended with the last run
+    }
     if (report_count_ == kStageCapacity) [[unlikely]] {
         flush_reports_blocking();
     }
@@ -424,7 +464,10 @@ bool Shard::try_flush() noexcept {
         market_.try_push_all(std::span<const MarketEvent>{market_stage_.data(), market_count_})) {
         market_count_ = 0;
     }
-    return report_count_ == 0 && market_count_ == 0;
+    if (journal_pending_ && journal_.try_push(journal_entry_)) {
+        journal_pending_ = false;
+    }
+    return report_count_ == 0 && market_count_ == 0 && !journal_pending_;
 }
 
 void Shard::flush_reports_blocking() noexcept {

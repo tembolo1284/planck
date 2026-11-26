@@ -5,7 +5,8 @@ target_link_libraries(planck_apps_support PUBLIC planck::net)
 
 # The venue.
 add_executable(planckd planckd.cpp)
-target_link_libraries(planckd PRIVATE planck_apps_support planck::gateway planck::feed)
+target_link_libraries(planckd PRIVATE planck_apps_support planck::gateway planck::feed
+                                      planck::journal)
 
 # An order entry client to type at or script.
 add_executable(planck-client planck_client.cpp)
@@ -14,3 +15,7 @@ target_link_libraries(planck-client PRIVATE planck_apps_support planck::wire)
 # A market data viewer.
 add_executable(planck-mdtap planck_mdtap.cpp)
 target_link_libraries(planck-mdtap PRIVATE planck_apps_support planck::feed)
+
+# Reads a journal: checks it, summarises it, or prints every command in it.
+add_executable(planck-replay planck_replay.cpp)
+target_link_libraries(planck-replay PRIVATE planck_apps_support planck::journal)

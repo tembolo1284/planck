@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # End-to-end check of the three programs as separate processes.
 #
-#   apps_smoke.sh <directory holding planckd, planck-client and planck-mdtap>
+#   apps_smoke.sh <directory holding planckd, planck-client and the rest>
 #
 # Starts a venue on loopback, trades through it with two clients, and checks
-# what each client was told, what appeared on the market data feed, that a
-# late subscriber can replay the feed, and that the venue shuts down cleanly.
+# what each client was told, what appeared on the market data feed, and that
+# a late subscriber can replay the feed. Then kills the venue outright,
+# starts it again from its journal, and checks that the books, the feed and
+# the session numbering all carried over.
 set -u
 
 bin="${1:?usage: apps_smoke.sh <bin directory>}"
@@ -56,11 +58,15 @@ retransmit_port=$((base + 3))
 
 # Two shards, so that routing by symbol and one feed stream per shard are
 # both exercised. Symbol S trades on shard S mod 2.
-"$bin/planckd" --listen "127.0.0.1:$order_port" --feed "127.0.0.1:$quiet_feed_port" \
-    --retransmit "127.0.0.1:$retransmit_port" --shards 2 --symbols 4 --orders 4096 --huge off \
-    > "$work/venue.log" 2>&1 &
-venue_pid=$!
-wait_for venue.log '^ready$'
+start_venue() {
+    "$bin/planckd" --listen "127.0.0.1:$order_port" --feed "127.0.0.1:$quiet_feed_port" \
+        --retransmit "127.0.0.1:$retransmit_port" --shards 2 --symbols 4 --orders 4096 \
+        --huge off --journal "$work/journal" > "$work/$1" 2>&1 &
+    venue_pid=$!
+    wait_for "$1" '^ready$'
+}
+start_venue venue.log
+expect venue.log '^shard 1 replayed 0 commands$' "a first start found something to replay"
 
 # A live subscriber, there from the first message.
 "$bin/planck-mdtap" --stream 1 --listen "127.0.0.1:$feed_port" --count 4 \
@@ -118,13 +124,77 @@ printf 'ping\n' |
     > "$work/twin.log" 2>&1 && fail "a duplicate client id was allowed to log in"
 expect twin.log '^login rejected reason=AlreadyLoggedIn$' "the duplicate login got the wrong answer"
 
-# Clean shutdown on SIGTERM, with final counters that match what happened.
+# ---- The venue dies without warning ----
+
+# Wait until the journal holds everything, then kill the venue outright. No
+# signal handler runs and nothing is flushed on the way out.
+journal_holds() {
+    "$bin/planck-replay" --file "$work/journal/shard-01.journal" > "$work/replay.log" 2>&1
+    grep -q '^commands=5 ' "$work/replay.log"
+}
+for _ in $(seq 1 100); do
+    journal_holds && break
+    sleep 0.1
+done
+journal_holds || fail "the journal never received the five commands shard 1 handled"
+expect replay.log '^intact$' "the journal is not intact"
+kill -KILL "$venue_pid"
+wait "$venue_pid" 2>/dev/null
+venue_pid=""
+kill "$maker_pid" 2>/dev/null
+wait "$maker_pid" 2>/dev/null
+maker_pid=""
+
+"$bin/planck-replay" --file "$work/journal/shard-01.journal" --dump > "$work/dump.log" 2>&1 ||
+    fail "the journal did not survive the kill"
+expect dump.log '^1 .* session=1 sell symbol=1 qty=10 price=1000 day ' "journal record 1 is wrong"
+expect dump.log '^4 .* session=2 cancel order_id=' "journal record 4 is wrong"
+expect dump.log '^5 .* session=2 buy symbol=1 qty=1 price=999999 day ' \
+    "a command the book rejected must still be in the journal"
+
+# ---- And comes back ----
+
+start_venue venue2.log
+expect venue2.log '^shard 1 replayed 5 commands$' "shard 1 was not rebuilt from its journal"
+expect venue2.log '^shard 0 replayed 1 commands$' "shard 0 was not rebuilt from its journal"
+
+# The maker's order still has 6 left in the book. A new client cannot cancel
+# it, because it belongs to a session that is gone, but can trade with it.
+maker_order="$(sed -n 's/^accepted client_order_id=1 order_id=\([0-9]*\) .*/\1/p' "$work/maker.log")"
+[ -n "$maker_order" ] || fail "could not find the maker's order id"
+printf 'cancel %s\nbuy 1 6 1000\n' "$maker_order" |
+    "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 3 \
+    > "$work/after.log" 2>&1 || fail "the client exited with an error after the restart"
+expect after.log '^logged in client_id=3 session=3$' \
+    "session ids must carry on above the ones in the journal"
+expect after.log '^executed .* qty=6 price=1000 leaves=0 taker ' \
+    "the order resting before the crash did not trade after it"
+expect after.log "^cancel rejected order_id=$maker_order reason=UnknownOrder\$" \
+    "a new session cancelled an order left by an old one"
+
+# A subscriber replaying from the start sees the first life's messages
+# exactly as they were, followed by the new trade.
+timeout 20 "$bin/planck-mdtap" --stream 1 --listen "127.0.0.1:$feed_port" \
+    --retransmit "127.0.0.1:$retransmit_port" --from-start --count 5 \
+    > "$work/reborn.log" 2>&1 || fail "the subscriber did not finish after the restart"
+for line in 1 2 3 4; do
+    before="$(grep "^$line " "$work/late.log")"
+    after="$(grep "^$line " "$work/reborn.log")"
+    [ -n "$before" ] && [ "$before" = "$after" ] ||
+        fail "feed message $line changed across the restart: '$before' became '$after'"
+done
+expect reborn.log '^5 trade symbol=1 qty=6 price=1000 ' "the trade after the restart is not on the feed"
+
+# Clean shutdown on SIGTERM, with final counters that match both lives.
 kill -TERM "$venue_pid"
 wait "$venue_pid" || fail "the venue did not exit cleanly"
 venue_pid=""
-expect venue.log '^stopping$' "the venue did not notice the signal"
-expect venue.log '^stats engine commands=6 accepted=4 rejected=1 trades=1 cancels=1 resting=2 ' \
+expect venue2.log '^stopping$' "the venue did not notice the signal"
+expect venue2.log '^stats engine commands=8 accepted=5 rejected=2 trades=2 cancels=1 resting=1 ' \
     "the venue's final counters are wrong"
-expect venue.log '^stats feed messages=5 ' "the venue's feed counters are wrong"
+expect venue2.log '^stats feed messages=6 ' "the venue's feed counters are wrong"
+expect venue2.log '^stats journal records=2 .* discarded=0 failed=0$' \
+    "the journal did not record the two commands of the second life"
+expect venue2.log '^stats latency reports=' "no latency was measured"
 
 echo "PASS"

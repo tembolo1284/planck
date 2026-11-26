@@ -96,15 +96,6 @@ add_library(planck_engine STATIC
 add_library(planck::engine ALIAS planck_engine)
 target_link_libraries(planck_engine PUBLIC planck_book planck_ring planck_wire)
 
-if(PLANCK_BUILD_APPS)
-    add_subdirectory(apps)
-endif()
-
-if(PLANCK_BUILD_TESTS)
-    enable_testing()
-    add_subdirectory(tests)
-endif()
-
 add_library(planck_net STATIC
     src/net/address.cpp
     src/net/poller.cpp
@@ -113,11 +104,17 @@ add_library(planck_net STATIC
 add_library(planck::net ALIAS planck_net)
 target_link_libraries(planck_net PUBLIC planck_sys)
 
+add_library(planck_perf STATIC
+    src/perf/histogram.cpp
+)
+add_library(planck::perf ALIAS planck_perf)
+target_link_libraries(planck_perf PUBLIC planck_core)
+
 add_library(planck_gateway STATIC
     src/gateway/gateway.cpp
 )
 add_library(planck::gateway ALIAS planck_gateway)
-target_link_libraries(planck_gateway PUBLIC planck_engine planck_net)
+target_link_libraries(planck_gateway PUBLIC planck_engine planck_net planck_perf)
 
 add_library(planck_feed STATIC
     src/feed/publisher.cpp
@@ -125,3 +122,21 @@ add_library(planck_feed STATIC
 )
 add_library(planck::feed ALIAS planck_feed)
 target_link_libraries(planck_feed PUBLIC planck_engine planck_net)
+
+add_library(planck_journal STATIC
+    src/journal/format.cpp
+    src/journal/reader.cpp
+    src/journal/recorder.cpp
+    src/journal/writer.cpp
+)
+add_library(planck::journal ALIAS planck_journal)
+target_link_libraries(planck_journal PUBLIC planck_engine)
+
+if(PLANCK_BUILD_APPS)
+    add_subdirectory(apps)
+endif()
+
+if(PLANCK_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()

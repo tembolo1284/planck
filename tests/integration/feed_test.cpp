@@ -72,8 +72,8 @@ protected:
         publisher_ = std::make_unique<Publisher>();
         ASSERT_EQ(publisher_->init(config), Status::Ok);
         ASSERT_EQ(publisher_->retransmit_endpoint(server_), Status::Ok);
-	tap_messages_ = 0;
-	tap_heartbeats_ = 0;
+        tap_messages_ = 0;
+        tap_heartbeats_ = 0;
     }
 
     // Enter `count` resting orders, which produces `count` MdAddOrder events,
@@ -158,6 +158,7 @@ protected:
     net::Endpoint tap_endpoint_{};
     net::Endpoint server_{};
     std::uint64_t next_id_ = 1;
+    // What captured() has read off the tap so far.
     std::uint64_t tap_messages_ = 0;
     std::uint64_t tap_heartbeats_ = 0;
 };

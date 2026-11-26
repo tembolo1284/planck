@@ -21,7 +21,8 @@ function(planck_add_test name)
     cmake_parse_arguments(ARG "" "LABEL" "SOURCES" ${ARGN})
     add_executable(${name} ${ARG_SOURCES})
     target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(${name} PRIVATE planck::gateway planck::feed GTest::gtest_main)
+    target_link_libraries(${name} PRIVATE planck::gateway planck::feed planck::journal
+                                          GTest::gtest_main)
     # A test that hangs is a failed test. Without a timeout CTest waits 25 minutes.
     gtest_discover_tests(${name} PROPERTIES LABELS ${ARG_LABEL} TIMEOUT 120 DISCOVERY_TIMEOUT 60)
 endfunction()
@@ -37,12 +38,15 @@ planck_add_test(planck_unit_tests LABEL unit SOURCES
     unit/wire_test.cpp
     unit/shard_test.cpp
     unit/net_test.cpp
+    unit/perf_test.cpp
+    unit/journal_test.cpp
 )
 
 # Randomized checks against an independent model. Scale with PLANCK_TEST_SCALE.
 planck_add_test(planck_property_tests LABEL property SOURCES
     property/book_differential_test.cpp
     property/shard_audit_test.cpp
+    property/journal_replay_test.cpp
 )
 
 # More than one thread, or real sockets on the loopback interface.
@@ -52,8 +56,8 @@ planck_add_test(planck_integration_tests LABEL integration SOURCES
     integration/gateway_test.cpp
     integration/feed_test.cpp
     integration/full_stack_test.cpp
+    integration/journal_thread_test.cpp
 )
-
 
 if(TARGET planckd)
     # Argument parsing and formatting shared by the programs in apps/.

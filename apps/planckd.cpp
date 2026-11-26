@@ -6,6 +6,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -14,6 +15,7 @@
 #include <thread>
 
 #include <sched.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #include "planck/core/bits.hpp"
@@ -21,6 +23,10 @@
 #include "planck/engine/shard.hpp"
 #include "planck/feed/publisher.hpp"
 #include "planck/gateway/gateway.hpp"
+#include "planck/journal/recorder.hpp"
+#include "planck/journal/replay.hpp"
+#include "planck/perf/histogram.hpp"
+#include "planck/sys/clock.hpp"
 #include "planck/sys/cpu.hpp"
 #include "planck/sys/memory.hpp"
 #include "support.hpp"
@@ -34,6 +40,7 @@ namespace core = planck::core;
 namespace engine = planck::engine;
 namespace feed = planck::feed;
 namespace gateway = planck::gateway;
+namespace journal = planck::journal;
 namespace net = planck::net;
 namespace sys = planck::sys;
 
@@ -50,8 +57,12 @@ constexpr char kUsage[] =
     "  --band-low TICKS           lowest price accepted       (0)\n"
     "  --band-ticks N             prices per symbol, a power of two (65536)\n"
     "  --orders N                 resting orders per shard    (1048576)\n"
+    "  --journal DIRECTORY        record every command here, and rebuild the books from\n"
+    "                             it at startup. Without this a restart starts empty.\n"
+    "  --journal-sync MS          longest a command may wait to reach the disk. 0 forces\n"
+    "                             the disk after every write  (10)\n"
     "  --cpus LIST                pin threads, e.g. 2-5. Shards take the first CPUs,\n"
-    "                             then the gateway, then the publisher.\n"
+    "                             then the gateway, the publisher and the journal.\n"
     "  --idle spin|yield|sleep    what an idle thread does    (spin with --cpus, else sleep)\n"
     "  --huge off|try|require     2 MiB pages                 (try)\n"
     "  --lock-memory              keep every page in RAM\n"
@@ -75,8 +86,14 @@ struct Options {
     Idle idle = Idle::Sleep;
     bool lock_memory = false;
     bool pin = false;
-    // One CPU per thread when pinning: shards, then gateway, then publisher.
-    std::array<std::size_t, core::kMaxShards + 2> cpus{};
+    // Empty means no journal.
+    std::string_view journal{};
+    std::uint32_t journal_sync_ms = 10;
+    // One CPU per thread when pinning: shards, then gateway, publisher and
+    // journal recorder.
+    std::array<std::size_t, core::kMaxShards + 3> cpus{};
+
+    [[nodiscard]] bool journaling() const noexcept { return !journal.empty(); }
 };
 
 // A counter one thread writes and another reads. The components keep plain
@@ -102,6 +119,10 @@ struct Lifecycle {
 struct ShardRuntime {
     engine::Shard shard;
     Lifecycle life;
+    // Rebuilding from the journal, which comes after life reaches Running.
+    Lifecycle recovery;
+    // Valid once recovery is Running.
+    journal::ReplayResult replayed{};
     std::thread thread;
     Counter commands, accepted, rejected, trades, cancels, cancel_rejects, stalls, resting;
 
@@ -127,7 +148,31 @@ struct GatewayRuntime {
     Counter sessions, connections, logins, messages_in, rejected, busy, reports_out,
         reports_dropped, protocol_errors, slow_consumers;
 
+    // Time from a request coming off the socket to its report being picked
+    // up to send, in counter ticks. Only the gateway thread touches it.
+    planck::perf::Histogram latency;
+    sys::TscClock clock;
+    std::uint64_t last_summary_tsc = 0;
+    Counter latency_count, latency_p50, latency_p99, latency_p999, latency_max;
+
+    // Working out percentiles walks the whole histogram, so do it a few
+    // times a second and no more.
+    void publish_latency() noexcept {
+        const std::uint64_t now = sys::tsc_now();
+        if ((now - last_summary_tsc) < (clock.ticks_per_second() / 4)) {
+            return;
+        }
+        last_summary_tsc = now;
+        const planck::perf::Summary summary = latency.summary();
+        latency_count.set(summary.count);
+        latency_p50.set(clock.to_nanos(summary.p50).raw());
+        latency_p99.set(clock.to_nanos(summary.p99).raw());
+        latency_p999.set(clock.to_nanos(summary.p999).raw());
+        latency_max.set(clock.to_nanos(summary.max).raw());
+    }
+
     void publish_stats() noexcept {
+        publish_latency();
         const gateway::GatewayStats& s = gateway.stats();
         sessions.set(gateway.active_sessions());
         connections.set(s.connections);
@@ -162,12 +207,33 @@ struct PublisherRuntime {
     }
 };
 
+struct JournalRuntime {
+    journal::Recorder recorder;
+    Lifecycle life;
+    std::thread thread;
+    Counter records, bytes, syncs, discarded, failed;
+
+    void publish_stats() noexcept {
+        const journal::RecorderStats& s = recorder.stats();
+        records.set(s.records);
+        bytes.set(s.bytes);
+        syncs.set(s.syncs);
+        discarded.set(s.discarded);
+        failed.set(recorder.failed() ? 1 : 0);
+    }
+};
+
 // Everything the process owns. Built once at startup and never moved: the
 // threads hold pointers into it.
 struct Venue {
     std::array<ShardRuntime, core::kMaxShards> shards;
     GatewayRuntime gateway;
     PublisherRuntime publisher;
+    JournalRuntime journal;
+    // Written by each shard's thread before its life reaches Running.
+    std::array<std::uint64_t, core::kMaxShards> fingerprints{};
+    // Set by main once the publisher is up and can take replayed market data.
+    std::atomic<bool> replay_go{false};
 
     std::array<engine::Shard*, core::kMaxShards> shard_pointers{};
     std::array<engine::SymbolConfig, core::kMaxSymbols> symbols{};
@@ -178,6 +244,8 @@ struct Venue {
     // the shards have gone, so nothing a shard produced is left behind.
     std::atomic<bool> stop_shards{false};
     std::atomic<bool> stop_io{false};
+    // The recorder goes last, after the shards have nothing more to say.
+    std::atomic<bool> stop_journal{false};
 };
 
 void idle_once(Idle idle) noexcept {
@@ -231,26 +299,56 @@ void shard_main(Venue& venue, const Options& options, std::size_t index,
     config.symbols = symbols;
     config.order_capacity = options.orders;
     config.huge_pages = options.huge;
+    config.journal_ring_capacity = options.journaling() ? (1U << 16) : 0;
     config.pin = options.pin;
     config.cpu = options.cpus[index];
     if (const Status status = runtime.shard.init(config); !ok(status)) {
         fail(runtime.life, status);
         return;
     }
+    venue.fingerprints[index] = journal::fingerprint(config);
     runtime.life.state.store(State::Running);
+
+    // Rebuild from the journal before taking live orders. Replay publishes
+    // market data, so wait until main says the publisher is there for it.
+    while (!venue.replay_go.load() && !venue.stop_shards.load()) {
+        idle_once(Idle::Sleep);
+    }
+    if (venue.stop_shards.load()) {
+        return;
+    }
+    if (options.journaling()) {
+        journal::Path path;
+        Status status = journal::shard_path(options.journal, runtime.shard.id(), path);
+        if (ok(status)) {
+            status = journal::replay(path.c_str(), runtime.shard, venue.fingerprints[index],
+                                     runtime.replayed,
+                                     [&options]() noexcept { idle_once(options.idle); });
+        }
+        if (!ok(status)) {
+            fail(runtime.recovery, status);
+            return;
+        }
+    }
+    runtime.recovery.state.store(State::Running);
     drive(runtime, venue.stop_shards, options.idle,
           [&runtime]() noexcept { return runtime.shard.poll(); });
 }
 
-void gateway_main(Venue& venue, const Options& options) noexcept {
+void gateway_main(Venue& venue, const Options& options, std::uint32_t first_session_id) noexcept {
     GatewayRuntime& runtime = venue.gateway;
     gateway::GatewayConfig config;
     config.listen = options.listen;
+    config.first_session_id = first_session_id;
+    config.latency = &runtime.latency;
     config.shards = std::span<engine::Shard* const>{venue.shard_pointers.data(), options.shards};
     config.routes = std::span<const gateway::Route>{venue.routes.data(), options.symbols};
     config.pin = options.pin;
     config.cpu = options.cpus[options.shards];
-    Status status = runtime.gateway.init(config);
+    Status status = runtime.clock.calibrate();
+    if (ok(status)) {
+        status = runtime.gateway.init(config);
+    }
     if (ok(status)) {
         status = runtime.gateway.local_endpoint(runtime.endpoint);
     }
@@ -283,6 +381,27 @@ void publisher_main(Venue& venue, const Options& options) noexcept {
     runtime.life.state.store(State::Running);
     drive(runtime, venue.stop_io, options.idle,
           [&runtime]() noexcept { return runtime.publisher.poll(); });
+}
+
+void journal_main(Venue& venue, const Options& options) noexcept {
+    JournalRuntime& runtime = venue.journal;
+    journal::RecorderConfig config;
+    config.shards = std::span<engine::Shard* const>{venue.shard_pointers.data(), options.shards};
+    config.fingerprints =
+        std::span<const std::uint64_t>{venue.fingerprints.data(), options.shards};
+    config.directory = options.journal;
+    config.sync_interval = core::Nanos{std::uint64_t{options.journal_sync_ms} * 1'000'000};
+    config.pin = options.pin;
+    config.cpu = options.cpus[options.shards + 2];
+    if (const Status status = runtime.recorder.init(config); !ok(status)) {
+        fail(runtime.life, status);
+        return;
+    }
+    runtime.life.state.store(State::Running);
+    drive(runtime, venue.stop_journal, options.idle,
+          [&runtime]() noexcept { return runtime.recorder.poll(); });
+    runtime.recorder.finish();
+    runtime.publish_stats();
 }
 
 // Wait for a thread to finish starting. False if it failed.
@@ -348,13 +467,32 @@ void print_stats(const Venue& venue, std::uint32_t shards) noexcept {
                 static_cast<unsigned long long>(p.retransmit_requests.get()),
                 static_cast<unsigned long long>(p.retransmitted_messages.get()),
                 static_cast<unsigned long long>(p.retransmit_refused.get()));
+    if (g.latency_count.get() != 0) {
+        std::printf("stats latency reports=%llu p50_ns=%llu p99_ns=%llu p999_ns=%llu max_ns=%llu\n",
+                    static_cast<unsigned long long>(g.latency_count.get()),
+                    static_cast<unsigned long long>(g.latency_p50.get()),
+                    static_cast<unsigned long long>(g.latency_p99.get()),
+                    static_cast<unsigned long long>(g.latency_p999.get()),
+                    static_cast<unsigned long long>(g.latency_max.get()));
+    }
+    const JournalRuntime& j = venue.journal;
+    if (j.life.state.load() == State::Running) {
+        std::printf("stats journal records=%llu bytes=%llu syncs=%llu discarded=%llu failed=%llu\n",
+                    static_cast<unsigned long long>(j.records.get()),
+                    static_cast<unsigned long long>(j.bytes.get()),
+                    static_cast<unsigned long long>(j.syncs.get()),
+                    static_cast<unsigned long long>(j.discarded.get()),
+                    static_cast<unsigned long long>(j.failed.get()));
+    }
 }
 
 [[nodiscard]] bool parse_choices(apps::Args& args, Options& options) noexcept {
     std::string_view huge = "try";
     std::string_view idle;
     std::string_view cpus;
-    if (!args.text("--huge", huge) || !args.text("--idle", idle) || !args.text("--cpus", cpus)) {
+    if (!args.text("--huge", huge) || !args.text("--idle", idle) || !args.text("--cpus", cpus) ||
+        !args.text("--journal", options.journal) ||
+        !args.number<std::uint32_t>("--journal-sync", options.journal_sync_ms, 0, 60'000)) {
         return false;
     }
 
@@ -375,7 +513,7 @@ void print_stats(const Venue& venue, std::uint32_t shards) noexcept {
             std::fprintf(stderr, "--cpus: expected a list such as 2-5 or 2,4,6,8\n");
             return false;
         }
-        const std::size_t needed = options.shards + 2;
+        const std::size_t needed = options.shards + (options.journaling() ? 3U : 2U);
         std::size_t found = 0;
         for (std::size_t cpu = 0; cpu < sys::kMaxCpus && found < needed; ++cpu) {
             if (set.test(cpu)) {
@@ -384,9 +522,10 @@ void print_stats(const Venue& venue, std::uint32_t shards) noexcept {
             }
         }
         if (found < needed) {
-            std::fprintf(stderr, "--cpus: %u shards need %zu CPUs (one each, plus the gateway "
-                                 "and the publisher), got %zu\n",
-                         options.shards, needed, found);
+            std::fprintf(stderr, "--cpus: %u shards need %zu CPUs (one each, plus the gateway, "
+                                 "the publisher%s), got %zu\n",
+                         options.shards, needed, options.journaling() ? " and the journal" : "",
+                         found);
             return false;
         }
         options.pin = true;
@@ -484,6 +623,8 @@ void shut_down(Venue& venue, std::uint32_t shards) noexcept {
     venue.stop_io.store(true);
     join(venue.gateway.thread);
     join(venue.publisher.thread);
+    venue.stop_journal.store(true);
+    join(venue.journal.thread);
 }
 
 [[nodiscard]] bool start(Venue& venue, const Options& options,
@@ -506,17 +647,51 @@ void shut_down(Venue& venue, std::uint32_t shards) noexcept {
         return false;
     }
 
-    // The gateway and the publisher need the shards to exist first.
-    venue.gateway.thread = std::thread([&venue, &options] { gateway_main(venue, options); });
+    // The publisher needs the shards to exist. It goes up before anything
+    // is replayed, so that subscribers get the rebuilt stream.
     venue.publisher.thread = std::thread([&venue, &options] { publisher_main(venue, options); });
-    const bool gateway_up = started(venue.gateway.life, "the order entry gateway");
-    const bool publisher_up = started(venue.publisher.life, "the market data publisher");
-    if (!publisher_up && net::is_multicast(options.feed.address)) {
-        std::fprintf(stderr, "planckd: if this host cannot send multicast, try "
-                             "--feed 127.0.0.1:%u\n",
-                     options.feed.port);
+    if (!started(venue.publisher.life, "the market data publisher")) {
+        if (net::is_multicast(options.feed.address)) {
+            std::fprintf(stderr, "planckd: if this host cannot send multicast, try "
+                                 "--feed 127.0.0.1:%u\n",
+                         options.feed.port);
+        }
+        return false;
     }
-    return gateway_up && publisher_up;
+
+    // Each shard now rebuilds itself from its journal, if there is one.
+    venue.replay_go.store(true);
+    std::uint32_t first_session_id = 1;
+    for (std::uint32_t i = 0; i < options.shards; ++i) {
+        up = started(venue.shards[i].recovery, "rebuilding a shard from its journal") && up;
+        const journal::ReplayResult& replayed = venue.shards[i].replayed;
+        if (replayed.max_session >= first_session_id) {
+            first_session_id = std::uint32_t{replayed.max_session} + 1;
+        }
+    }
+    if (!up) {
+        std::fprintf(stderr,
+                     "planckd: InvalidArgument means the journal was written with other settings "
+                     "(--symbols, --band-low, --band-ticks, --orders, --shards).\n"
+                     "planckd: Protocol means it is damaged before its end. Look at it with "
+                     "planck-replay before deciding what to do.\n");
+        return false;
+    }
+
+    // The recorder checks that every journal is where its shard now is.
+    if (options.journaling()) {
+        venue.journal.thread = std::thread([&venue, &options] { journal_main(venue, options); });
+        if (!started(venue.journal.life, "the journal recorder")) {
+            return false;
+        }
+    }
+
+    // Clients last, once there is a venue for them to talk to. New sessions
+    // get ids above any the journal mentions, so nobody inherits an old
+    // session's resting orders.
+    venue.gateway.thread = std::thread(
+        [&venue, &options, first_session_id] { gateway_main(venue, options, first_session_id); });
+    return started(venue.gateway.life, "the order entry gateway");
 }
 
 void print_banner(const Venue& venue, const Options& options) noexcept {
@@ -537,6 +712,17 @@ void print_banner(const Venue& venue, const Options& options) noexcept {
     std::printf("order entry on %s\n", apps::format_endpoint(venue.gateway.endpoint).c_str());
     std::printf("retransmit requests on %s\n",
                 apps::format_endpoint(venue.publisher.endpoint).c_str());
+    if (options.journaling()) {
+        std::printf("journal in %.*s, synced within %u ms\n",
+                    static_cast<int>(options.journal.size()), options.journal.data(),
+                    options.journal_sync_ms);
+        for (std::uint32_t i = 0; i < options.shards; ++i) {
+            const journal::ReplayResult& replayed = venue.shards[i].replayed;
+            std::printf("shard %u replayed %llu commands%s\n", i,
+                        static_cast<unsigned long long>(replayed.records),
+                        replayed.torn_tail ? ", and dropped a torn record at the end" : "");
+        }
+    }
     std::printf("ready\n");
 }
 
@@ -547,6 +733,15 @@ int run(const Options& options) noexcept {
             const std::string_view reason = core::to_string(status);
             std::fprintf(stderr, "planckd: --lock-memory failed: %.*s (raise ulimit -l)\n",
                          static_cast<int>(reason.size()), reason.data());
+            return 1;
+        }
+    }
+
+    if (options.journaling()) {
+        // The string came from argv, so it ends in a terminator.
+        if (::mkdir(options.journal.data(), 0755) != 0 && errno != EEXIST) {
+            std::fprintf(stderr, "planckd: cannot create the journal directory %s\n",
+                         options.journal.data());
             return 1;
         }
     }
@@ -565,8 +760,14 @@ int run(const Options& options) noexcept {
     const timespec tick{.tv_sec = 0, .tv_nsec = 100'000'000};
     const std::uint32_t ticks_per_report = options.stats_seconds * 10;
     std::uint32_t ticks = 0;
+    bool journal_failure_reported = false;
     while (!stop.load(std::memory_order_relaxed)) {
         static_cast<void>(::nanosleep(&tick, nullptr));
+        if (!journal_failure_reported && venue->journal.failed.get() != 0) {
+            std::fprintf(stderr, "planckd: THE JOURNAL HAS FAILED. Matching continues, but nothing "
+                                 "from here on is being recorded and a restart will lose it.\n");
+            journal_failure_reported = true;
+        }
         ++ticks;
         if (ticks_per_report != 0 && ticks >= ticks_per_report) {
             print_stats(*venue, options.shards);
