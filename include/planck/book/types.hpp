@@ -33,6 +33,7 @@ struct NewOrder {
     core::TimeInForce tif = core::TimeInForce::Day;
     core::Price price{};
     core::Qty qty{};
+    std::uint32_t owner = 0;
 };
 
 // Outcome of OrderBook::add. If reject is None then
@@ -61,6 +62,7 @@ struct Trade {
     core::Qty qty{};
     // What the resting order has left. Zero means it has left the book.
     core::Qty resting_leaves{};
+    std::uint32_t resting_owner = 0;
     core::Side aggressor_side = core::Side::Buy;
 };
 

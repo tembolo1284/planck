@@ -81,3 +81,9 @@ add_library(planck_wire STATIC
 )
 add_library(planck::wire ALIAS planck_wire)
 target_link_libraries(planck_wire PUBLIC planck_core)
+
+add_library(planck_engine STATIC
+    src/engine/shard.cpp
+)
+add_library(planck::engine ALIAS planck_engine)
+target_link_libraries(planck_engine PUBLIC planck_book planck_ring planck_wire)

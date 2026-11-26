@@ -131,8 +131,7 @@ private:
                          const Order& filled) noexcept;
 
     // Append an order to the back of its price level.
-    void rest(mem::Index slot, core::Side side, core::Price price, Offset offset,
-              core::Qty qty) noexcept;
+    void rest(mem::Index slot, const NewOrder& order, Offset offset, core::Qty qty) noexcept;
 
     // A level just emptied. Clear its bit and, if it was the best, find the
     // next best.
@@ -205,7 +204,7 @@ AddResult OrderBook::add(const NewOrder& order, S& sink) noexcept {
     core::Qty resting{0};
     if (slot != mem::kNullIndex) {
         if (left > core::Qty{0}) {
-            rest(slot, order.side, order.price, limit, left);
+            rest(slot, order, limit, left);
             resting = left;
         } else {
             store_->release(slot);
@@ -253,6 +252,7 @@ core::Qty OrderBook::match(core::Side side, Offset limit, core::OrderId aggresso
                             .price = resting.price,
                             .qty = fill,
                             .resting_leaves = resting.qty,
+                            .resting_owner = resting.owner,
                             .aggressor_side = side});
 
         if (resting.qty == core::Qty{0}) {
@@ -282,12 +282,12 @@ inline void OrderBook::pop_filled_head(bool aggressor_is_buy, Offset offset, Lev
     store_->release(slot);
 }
 
-inline void OrderBook::rest(mem::Index slot, core::Side side, core::Price price, Offset offset,
+inline void OrderBook::rest(mem::Index slot, const NewOrder& incoming, Offset offset,
                             core::Qty qty) noexcept {
     PLANCK_EXPECT(offset < band_ticks_);
     PLANCK_EXPECT(qty > core::Qty{0});
 
-    const bool buy = (side == core::Side::Buy);
+    const bool buy = (incoming.side == core::Side::Buy);
     // Matching has already removed everything this order could trade with,
     // so resting it cannot cross the book.
     PLANCK_ASSERT(buy ? (best_ask_ == kNoLevel || best_ask_ > offset)
@@ -298,9 +298,10 @@ inline void OrderBook::rest(mem::Index slot, core::Side side, core::Price price,
     order.next = mem::kNullIndex;
     order.prev = level.tail;
     order.qty = qty;
-    order.price = price;
+    order.price = incoming.price;
+    order.owner = incoming.owner;
     order.symbol = symbol_;
-    order.side = side;
+    order.side = incoming.side;
 
     if (level.tail == mem::kNullIndex) {
         level.head = slot;

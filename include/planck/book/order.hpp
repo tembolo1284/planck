@@ -24,10 +24,10 @@ struct Order {
     core::Qty qty{};                    // open quantity
     core::Price price{};
     core::OrderId id = core::kNoOrderId;
-    std::uint32_t reserved = 0;
+    std::uint32_t owner = 0;
     core::SymbolId symbol{};
     core::Side side = core::Side::Buy;
-    std::uint8_t reserved2 = 0;
+    std::uint8_t reserved = 0;
 };
 
 static_assert(sizeof(Order) == 32);
