@@ -294,6 +294,15 @@ One thread that owns every client connection.
   its backlog would mean unbounded memory or stalling everyone (D-03).
 - **Per pass:** up to 8 accepts, 4 reads per ready socket, 256 reports per
   shard, one send per session with something to say.
+- **Silence** (S-31). Each connection carries the time it was last heard
+  from and last sent to, on the gateway's own clock, read once a pass. A
+  few times in each interval the gateway looks over every slot: it ends a
+  connection not heard from for the idle timeout, or not logged in by
+  then, and it sends a `Heartbeat` to a client sent nothing for the
+  heartbeat interval. If two passes are 100 ms or more apart the gateway
+  itself was held up, and everyone gets a fresh start: what they sent
+  meanwhile has not been read yet. Off unless configured. `planckd` turns
+  it on.
 - **Login** checks the protocol version, that the client id is in range,
   that it is listed with that token if the venue has a clients file
   (`Credentials`, S-23), and that no other connection holds the session. A

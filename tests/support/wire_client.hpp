@@ -78,6 +78,20 @@ public:
         return message;
     }
 
+    // True if the next message is a T. Gives one a short while to arrive.
+    template <wire::Message T>
+    bool pending() {
+        for (int attempt = 0; attempt < kQuietAttempts; ++attempt) {
+            wait();
+            fill();
+            const wire::Frame frame = wire::next_frame({buffer_.data(), length_});
+            if (frame.status == core::Status::Ok) {
+                return frame.type == T::kType;
+            }
+        }
+        return false;
+    }
+
     // True if no message arrives for a short while.
     bool quiet() {
         for (int attempt = 0; attempt < kQuietAttempts; ++attempt) {

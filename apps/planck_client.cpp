@@ -52,7 +52,9 @@ constexpr char kCommands[] =
     "  sell SYMBOL QTY market\n"
     "  cancel ORDER_ID                       the order_id from an 'accepted' line\n"
     "  cancel last                           the most recently accepted order\n"
-    "  ping                                  heartbeat, echoed by the venue\n"
+    "  ping                                  send a heartbeat now. The venue does not\n"
+    "                                        answer one. The client sends them by\n"
+    "                                        itself whenever it has been quiet.\n"
     "  wait MS                               pause, for scripts\n"
     "  help\n"
     "  quit\n";
@@ -64,7 +66,7 @@ constexpr std::uint64_t kAnswerTimeoutNs = 5'000 * kNanosPerMilli;
 enum ExitCode : int { kOk = 0, kFailed = 1, kBadUsage = 2 };
 
 // What the client is waiting for before it will read another command.
-enum class Awaiting : std::uint8_t { Nothing, Login, OrderAnswer, CancelAnswer, Heartbeat };
+enum class Awaiting : std::uint8_t { Nothing, Login, OrderAnswer, CancelAnswer };
 
 std::string_view text_of(wire::LoginRejectReason reason) noexcept {
     switch (reason) {
@@ -129,7 +131,12 @@ private:
     std::uint64_t linger_ns_;
     Awaiting awaiting_ = Awaiting::Nothing;
     std::uint64_t sent_at_ = 0;        // when the request being awaited went out
-    std::uint64_t last_activity_ = 0;  // last send or receive
+    std::uint64_t last_activity_ = 0;  // last send or receive, heartbeats aside
+    std::uint64_t last_sent_ = 0;      // last send of any kind
+    std::uint64_t last_heard_ = 0;     // last bytes from the venue
+    // From the venue's LoginAccepted: how long it lets a client stay silent.
+    // Zero until logged in, and for a venue that does not care.
+    std::uint64_t venue_timeout_ns_ = 0;
     std::uint64_t paused_until_ = 0;   // set by "wait"
     std::uint64_t next_client_order_id_ = 1;
     std::uint64_t last_order_id_ = 0;
@@ -163,9 +170,14 @@ bool Client::send(const T& message, Awaiting answer) noexcept {
         failed_ = true;
         return false;
     }
-    sent_at_ = now();
-    last_activity_ = sent_at_;
-    awaiting_ = answer;
+    last_sent_ = now();
+    // A heartbeat is not something to wait for an answer to, nor a reason
+    // to stay connected longer.
+    if (T::kType != wire::MsgType::Heartbeat) {
+        sent_at_ = last_sent_;
+        last_activity_ = last_sent_;
+        awaiting_ = answer;
+    }
     return true;
 }
 
@@ -184,6 +196,7 @@ void Client::print(const wire::Frame& frame) noexcept {
             wire::LoginAccepted m;
             if (ok(wire::decode(frame.bytes, m))) {
                 std::printf("logged in client_id=%u session=%u\n", client_id_, m.session_id);
+                venue_timeout_ns_ = std::uint64_t{m.idle_timeout_ms} * kNanosPerMilli;
                 awaiting_ = (awaiting_ == Awaiting::Login) ? Awaiting::Nothing : awaiting_;
             }
             break;
@@ -256,8 +269,7 @@ void Client::print(const wire::Frame& frame) noexcept {
             break;
         }
         case wire::MsgType::Heartbeat:
-            std::printf("heartbeat\n");
-            answered(Awaiting::Heartbeat);
+            // The venue saying it is still there. Nothing to show or answer.
             break;
         default: {
             const std::string_view name = wire::to_string(frame.type);
@@ -278,7 +290,7 @@ bool Client::receive() noexcept {
         return false;
     }
     rx_length_ += result.bytes;
-    last_activity_ = now();
+    last_heard_ = now();
 
     std::size_t offset = 0;
     // Each pass consumes at least a header, so the buffer size bounds this.
@@ -290,6 +302,9 @@ bool Client::receive() noexcept {
         if (!ok(frame.status)) {
             std::fprintf(stderr, "planck-client: the venue sent bytes that are not the protocol\n");
             return false;
+        }
+        if (frame.type != wire::MsgType::Heartbeat) {
+            last_activity_ = last_heard_;
         }
         print(frame);
         offset += frame.bytes.size();
@@ -411,7 +426,7 @@ void Client::run_command(std::string_view line) noexcept {
     } else if (verb == "cancel") {
         cancel(words);
     } else if (verb == "ping") {
-        static_cast<void>(send(wire::Heartbeat{}, Awaiting::Heartbeat));
+        static_cast<void>(send(wire::Heartbeat{}, Awaiting::Nothing));
     } else if (verb == "wait") {
         std::uint64_t ms = 0;
         if (count == 2 && apps::parse_number<std::uint64_t>(words[1], ms, 1, 600'000)) {
@@ -446,6 +461,9 @@ int Client::poll_timeout_ms(std::uint64_t at) const noexcept {
     if (!input_open_) {
         sooner(last_activity_ + linger_ns_);
     }
+    if (venue_timeout_ns_ != 0) {
+        sooner(last_sent_ + (venue_timeout_ns_ / 3));
+    }
     // Round up, so a deadline 0.2 ms away does not turn into a busy loop.
     return static_cast<int>((wait_ns + kNanosPerMilli - 1) / kNanosPerMilli);
 }
@@ -472,6 +490,20 @@ int Client::run(net::Endpoint server, const std::atomic<bool>& stop) noexcept {
         if (awaiting_ != Awaiting::Nothing && (at - sent_at_) > kAnswerTimeoutNs) {
             std::fprintf(stderr, "planck-client: no answer from the venue after 5 seconds\n");
             return kFailed;
+        }
+        if (venue_timeout_ns_ != 0) {
+            // The venue drops a client it hears nothing from, and cancels its
+            // orders. Say something three times as often as it insists on.
+            if ((at - last_sent_) >= (venue_timeout_ns_ / 3) &&
+                !send(wire::Heartbeat{}, Awaiting::Nothing)) {
+                return kFailed;
+            }
+            // It works both ways: a venue this quiet is not there any more.
+            if ((at - last_heard_) > (2 * venue_timeout_ns_)) {
+                std::fprintf(stderr, "planck-client: nothing heard from the venue for %llu ms\n",
+                             static_cast<unsigned long long>((at - last_heard_) / kNanosPerMilli));
+                return kFailed;
+            }
         }
         run_commands();
         const bool idle = (awaiting_ == Awaiting::Nothing) && (paused_until_ == 0);

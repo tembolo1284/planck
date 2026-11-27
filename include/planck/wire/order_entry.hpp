@@ -12,8 +12,12 @@ namespace planck::wire {
 // Order entry runs over TCP, one session per connection. The client logs in,
 // then sends NewOrder and CancelOrder. The venue answers every NewOrder with
 // exactly one OrderAccepted or OrderRejected, then zero or more Executed, and
-// a Canceled if the order leaves the book unfilled. Either side sends
-// Heartbeat when it has been quiet.
+// a Canceled if the order leaves the book unfilled.
+//
+// Either side sends Heartbeat when it has had nothing else to say for a
+// while, so that the other can tell a quiet line from a dead one. Nobody
+// answers a Heartbeat. LoginAccepted tells the client how long the venue
+// will put up with hearing nothing from it.
 //
 // Each struct's default value already has a correct header, so
 //     NewOrder order{};
@@ -35,7 +39,10 @@ struct LoginAccepted {
     static constexpr MsgType kType = MsgType::LoginAccepted;
     MsgHeader header{sizeof(LoginAccepted), kType, 0};
     std::uint16_t session_id = 0;
-    std::uint16_t reserved = 0;
+    // The venue ends a connection it has heard nothing on for this long, in
+    // milliseconds. Zero means it never does. A client should send something,
+    // a Heartbeat if nothing else, about three times as often.
+    std::uint16_t idle_timeout_ms = 0;
 };
 
 struct LoginRejected {

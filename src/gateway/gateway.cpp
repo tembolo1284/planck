@@ -18,6 +18,8 @@ namespace {
 using core::ok;
 using core::Status;
 
+constexpr std::uint64_t kNanosPerMilli = 1'000'000;
+
 Status validate(const GatewayConfig& config) noexcept {
     if (config.shards.empty() || config.shards.size() > core::kMaxShards) {
         return Status::InvalidArgument;
@@ -27,6 +29,17 @@ Status validate(const GatewayConfig& config) noexcept {
     }
     // A connection must at least be able to hold one of every message.
     if (config.tx_buffer_bytes < wire::kMaxMessageSize || config.tx_buffer_bytes > (16U << 20)) {
+        return Status::InvalidArgument;
+    }
+    if (config.idle_timeout_ms > Gateway::kMaxIdleTimeoutMs ||
+        config.heartbeat_interval_ms > Gateway::kMaxIdleTimeoutMs) {
+        return Status::OutOfRange;
+    }
+    // A venue that drops silent clients must not be silent itself, or a
+    // client could not tell a quiet venue from a dead one. And it must give
+    // a client longer than it takes itself.
+    if (config.idle_timeout_ms != 0 && (config.heartbeat_interval_ms == 0 ||
+                                        config.idle_timeout_ms <= config.heartbeat_interval_ms)) {
         return Status::InvalidArgument;
     }
     return Status::Ok;
@@ -113,6 +126,20 @@ Status Gateway::init(const GatewayConfig& config) noexcept {
     shards_ = config.shards;
     max_sessions_ = config.max_sessions;
     credentials_ = config.credentials;
+    clock_ = config.clock;
+    heartbeat_ns_ = std::uint64_t{config.heartbeat_interval_ms} * kNanosPerMilli;
+    idle_timeout_ns_ = std::uint64_t{config.idle_timeout_ms} * kNanosPerMilli;
+    idle_timeout_ms_ = static_cast<std::uint16_t>(config.idle_timeout_ms);
+    // Look often enough that nothing is more than an eighth late, and no
+    // more often than every millisecond.
+    const std::uint64_t shorter = (heartbeat_ns_ != 0 && heartbeat_ns_ < idle_timeout_ns_)
+                                      ? heartbeat_ns_
+                                      : ((idle_timeout_ns_ != 0) ? idle_timeout_ns_ : heartbeat_ns_);
+    check_every_ns_ = (shorter / 8 > kNanosPerMilli) ? shorter / 8 : kNanosPerMilli;
+    if (heartbeat_ns_ != 0 || idle_timeout_ns_ != 0) {
+        now_ns_ = (clock_ != nullptr) ? clock_() : sys::monotonic_now().raw();
+        next_check_ns_ = now_ns_ + check_every_ns_;
+    }
     latency_ = config.latency;
     tx_capacity_ = config.tx_buffer_bytes;
     idle_ = config.idle;
@@ -124,6 +151,10 @@ std::size_t Gateway::poll() noexcept {
     PLANCK_EXPECT(initialised());
 
     std::size_t work = 0;
+    const bool timed = (heartbeat_ns_ != 0) || (idle_timeout_ns_ != 0);
+    if (timed) {
+        keep_time();
+    }
     std::array<net::Event, net::Poller::kMaxEvents> events{};
     const std::size_t ready = poller_.wait(events, 0);
     for (std::size_t i = 0; i < ready; ++i) {
@@ -146,6 +177,11 @@ std::size_t Gateway::poll() noexcept {
 
     if (owed_count_ != 0) [[unlikely]] {
         send_owed_closes();
+    }
+    // After the reads, so that what arrived just now counts as heard.
+    if (timed && now_ns_ >= next_check_ns_) {
+        next_check_ns_ = now_ns_ + check_every_ns_;
+        check_connections();
     }
     work += route_reports();
     flush_dirty();
@@ -202,6 +238,9 @@ std::size_t Gateway::accept_clients() noexcept {
         connection->dirty = false;
         connection->rx_length = 0;
         connection->tx_length = 0;
+        connection->opened_ns = now_ns_;
+        connection->heard_ns = now_ns_;
+        connection->sent_ns = now_ns_;
         ++active_;
     }
     return accepted;
@@ -224,6 +263,7 @@ std::size_t Gateway::read_connection(Connection& connection) noexcept {
             break;
         }
         ++reads;
+        connection.heard_ns = now_ns_;
         if (connection.closing) {
             continue;  // on its way out: whatever it says now is not heard
         }
@@ -295,7 +335,9 @@ bool Gateway::dispatch(Connection& connection, const wire::Frame& frame,
             return true;
         }
         case wire::MsgType::Heartbeat:
-            queue_message(connection, wire::Heartbeat{});
+            // Its arrival is the whole message. Nobody answers a heartbeat,
+            // or two ends that both did would never stop.
+            ++stats_.heartbeats_in;
             return true;
         case wire::MsgType::Logout:
             disconnect(connection);
@@ -342,6 +384,7 @@ void Gateway::on_login(Connection& connection, const wire::LoginRequest& request
     ++stats_.logins;
     wire::LoginAccepted accepted{};
     accepted.session_id = connection.session.raw();
+    accepted.idle_timeout_ms = idle_timeout_ms_;
     queue_message(connection, accepted);
 }
 
@@ -454,6 +497,7 @@ void Gateway::queue(Connection& connection, std::span<const std::byte> bytes) no
     }
     std::memcpy(connection.tx + connection.tx_length, bytes.data(), bytes.size());
     connection.tx_length += static_cast<std::uint32_t>(bytes.size());
+    connection.sent_ns = now_ns_;
     if (!connection.dirty) {
         connection.dirty = true;
         PLANCK_ASSERT(dirty_count_ < dirty_slots_.size());
@@ -519,6 +563,52 @@ void Gateway::disconnect(Connection& connection) noexcept {
     connection.tx_length = 0;
     --active_;
     ++stats_.disconnects;
+}
+
+void Gateway::keep_time() noexcept {
+    const std::uint64_t before = now_ns_;
+    const std::uint64_t read = (clock_ != nullptr) ? clock_() : sys::monotonic_now().raw();
+    now_ns_ = (read > before) ? read : before;
+    if (now_ns_ - before < kOwnPauseNs) {
+        return;
+    }
+    // The gateway itself was held up: descheduled, stopped in a debugger,
+    // or busy. Whatever clients sent meanwhile has not been read yet, so
+    // the silence is ours and not theirs. Everyone starts afresh.
+    for (Connection& connection : connections_) {
+        if (connection.open) {
+            connection.heard_ns = now_ns_;
+            connection.opened_ns = now_ns_;
+        }
+    }
+    next_check_ns_ = now_ns_ + check_every_ns_;
+}
+
+void Gateway::check_connections() noexcept {
+    for (Connection& connection : connections_) {
+        if (!connection.open) {
+            continue;
+        }
+        if (idle_timeout_ns_ != 0) {
+            if (now_ns_ - connection.heard_ns >= idle_timeout_ns_) {
+                ++stats_.idle_timeouts;
+                disconnect(connection);
+                continue;
+            }
+            // Talking is not enough: it has to say who it is.
+            if (connection.session.raw() == 0 &&
+                now_ns_ - connection.opened_ns >= idle_timeout_ns_) {
+                ++stats_.login_timeouts;
+                disconnect(connection);
+                continue;
+            }
+        }
+        if (heartbeat_ns_ != 0 && connection.session.raw() != 0 && !connection.closing &&
+            now_ns_ - connection.sent_ns >= heartbeat_ns_) {
+            ++stats_.heartbeats_out;
+            queue_message(connection, wire::Heartbeat{});
+        }
+    }
 }
 
 void Gateway::close_session(core::SessionId session) noexcept {

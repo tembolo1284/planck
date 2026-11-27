@@ -61,6 +61,12 @@ constexpr char kUsage[] =
     "                             Without this anyone may, as any client id.\n"
     "  --journal DIRECTORY        record every command here, and rebuild the books from\n"
     "                             it at startup. Without this a restart starts empty.\n"
+    "  --heartbeat MS             send a heartbeat to a client that has been sent\n"
+    "                             nothing for this long. 0 never does.     (1000)\n"
+    "  --idle-timeout MS          end a connection that nothing has been heard on\n"
+    "                             for this long, and cancel its orders. 0 never\n"
+    "                             does, and needs --heartbeat 0 as well.\n"
+    "                             Otherwise longer than --heartbeat.       (5000)\n"
     "  --journal-sync MS          longest a command may wait to reach the disk. 0 forces\n"
     "                             the disk after every write  (10)\n"
     "  --cpus LIST                pin threads, e.g. 2-5. Shards take the first CPUs,\n"
@@ -94,6 +100,8 @@ struct Options {
     // Empty means no journal.
     std::string_view journal{};
     std::uint32_t journal_sync_ms = 10;
+    std::uint32_t heartbeat_ms = 1000;
+    std::uint32_t idle_timeout_ms = 5000;
     // Empty means anyone may log in.
     std::string_view clients{};
     // One CPU per thread when pinning: shards, then gateway, publisher and
@@ -156,7 +164,8 @@ struct GatewayRuntime {
     // Valid once state is Running.
     net::Endpoint endpoint{};
     Counter sessions, connections, logins, messages_in, rejected, busy, reports_out,
-        reports_dropped, protocol_errors, slow_consumers, bad_credentials, session_closes;
+        reports_dropped, protocol_errors, slow_consumers, bad_credentials, session_closes,
+        heartbeats_out, idle_timeouts, login_timeouts;
 
     // Time from a request coming off the socket to its report being picked
     // up to send, in counter ticks. Only the gateway thread touches it.
@@ -196,6 +205,9 @@ struct GatewayRuntime {
         slow_consumers.set(s.slow_consumers);
         bad_credentials.set(s.bad_credentials);
         session_closes.set(s.session_closes);
+        heartbeats_out.set(s.heartbeats_out);
+        idle_timeouts.set(s.idle_timeouts);
+        login_timeouts.set(s.login_timeouts);
     }
 };
 
@@ -356,6 +368,8 @@ void gateway_main(Venue& venue, const Options& options) noexcept {
     gateway::GatewayConfig config;
     config.listen = options.listen;
     config.credentials = options.restricted() ? &venue.credentials : nullptr;
+    config.heartbeat_interval_ms = options.heartbeat_ms;
+    config.idle_timeout_ms = options.idle_timeout_ms;
     config.latency = &runtime.latency;
     config.shards = std::span<engine::Shard* const>{venue.shard_pointers.data(), options.shards};
     config.routes = std::span<const gateway::Route>{venue.routes.data(), options.symbols};
@@ -466,7 +480,8 @@ void print_stats(const Venue& venue, std::uint32_t shards) noexcept {
                 static_cast<unsigned long long>(resting), static_cast<unsigned long long>(stalls));
     std::printf("stats gateway sessions=%llu connections=%llu logins=%llu messages=%llu "
                 "rejected=%llu busy=%llu reports=%llu dropped=%llu protocol_errors=%llu "
-                "slow_consumers=%llu bad_credentials=%llu session_closes=%llu\n",
+                "slow_consumers=%llu bad_credentials=%llu session_closes=%llu heartbeats=%llu "
+                "idle_timeouts=%llu login_timeouts=%llu\n",
                 static_cast<unsigned long long>(g.sessions.get()),
                 static_cast<unsigned long long>(g.connections.get()),
                 static_cast<unsigned long long>(g.logins.get()),
@@ -478,7 +493,10 @@ void print_stats(const Venue& venue, std::uint32_t shards) noexcept {
                 static_cast<unsigned long long>(g.protocol_errors.get()),
                 static_cast<unsigned long long>(g.slow_consumers.get()),
                 static_cast<unsigned long long>(g.bad_credentials.get()),
-                static_cast<unsigned long long>(g.session_closes.get()));
+                static_cast<unsigned long long>(g.session_closes.get()),
+                static_cast<unsigned long long>(g.heartbeats_out.get()),
+                static_cast<unsigned long long>(g.idle_timeouts.get()),
+                static_cast<unsigned long long>(g.login_timeouts.get()));
     std::printf("stats feed messages=%llu datagrams=%llu heartbeats=%llu send_failures=%llu "
                 "retransmit_requests=%llu retransmitted=%llu refused=%llu\n",
                 static_cast<unsigned long long>(p.messages.get()),
@@ -513,7 +531,15 @@ void print_stats(const Venue& venue, std::uint32_t shards) noexcept {
     std::string_view cpus;
     if (!args.text("--huge", huge) || !args.text("--idle", idle) || !args.text("--cpus", cpus) ||
         !args.text("--journal", options.journal) || !args.text("--clients", options.clients) ||
-        !args.number<std::uint32_t>("--journal-sync", options.journal_sync_ms, 0, 60'000)) {
+        !args.number<std::uint32_t>("--journal-sync", options.journal_sync_ms, 0, 60'000) ||
+        !args.number<std::uint32_t>("--heartbeat", options.heartbeat_ms, 0, 60'000) ||
+        !args.number<std::uint32_t>("--idle-timeout", options.idle_timeout_ms, 0, 60'000)) {
+        return false;
+    }
+    if (options.idle_timeout_ms != 0 &&
+        (options.heartbeat_ms == 0 || options.idle_timeout_ms <= options.heartbeat_ms)) {
+        std::fprintf(stderr, "planckd: --idle-timeout must be longer than --heartbeat, and "
+                             "--heartbeat may be 0 only if --idle-timeout is too\n");
         return false;
     }
 
@@ -730,6 +756,12 @@ void print_banner(const Venue& venue, const Options& options) noexcept {
                     static_cast<int>(options.clients.size()), options.clients.data());
     } else {
         std::printf("clients: anyone may log in, as any client id (no --clients file)\n");
+    }
+    if (options.idle_timeout_ms != 0) {
+        std::printf("clients: one heard nothing from for %u ms is disconnected\n",
+                    options.idle_timeout_ms);
+    } else {
+        std::printf("clients: a dead line is never noticed (--idle-timeout 0)\n");
     }
     std::printf("retransmit requests on %s\n",
                 apps::format_endpoint(venue.publisher.endpoint).c_str());

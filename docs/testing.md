@@ -1,6 +1,6 @@
 # Testing
 
-324 tests. This page says how to run them, what each group proves, and what
+332 tests. This page says how to run them, what each group proves, and what
 is expected of new code.
 
 ## Running
@@ -38,12 +38,12 @@ Each test has a label. `-L` selects by it.
 |-------|------:|------------|----------|
 | `unit` | 225 | One module at a time, deterministic, fast | `planck_unit_tests`, `planck_apps_tests`, `planck_bench_tests` |
 | `property` | 22 | Random runs against an independent model | `planck_property_tests` |
-| `integration` | 51 | More than one thread, or real sockets on loopback | `planck_integration_tests` |
+| `integration` | 59 | More than one thread, or real sockets on loopback | `planck_integration_tests` |
 | `capi` | 21 | The C library, from C++, C and Python | `planck_capi_tests`, `planck_capi_smoke`, two scripts |
 | `e2e` | 2 | The programs as separate processes | `apps_smoke.sh`, `bench_smoke.sh` |
 | `tools` | 3 | The scripts and the house rules | `scripts_smoke.sh`, `check_style.py`, `test_tools.py` |
 
-Sanitizer builds run 323, because the Python test of the C library is
+Sanitizer builds run 331, because the Python test of the C library is
 skipped there. So does a machine without Python's `cffi`.
 
 ### unit (`tests/unit/`)
@@ -88,7 +88,7 @@ for ever on a single thread, which no shorter run had hit.
 |------|--------|
 | `ring_stress_test.cpp` | Two threads, millions of messages, every one delivered once and in order, for several ring sizes |
 | `shard_thread_test.cpp` | A shard on its own thread through a long random run, with a `FeedAuditor` checking every message |
-| `gateway_test.cpp` | Login and who is let in, sessions that outlive connections, cancel on disconnect, routing, rejects, protocol violations, connection limits, all over real TCP |
+| `gateway_test.cpp` | Login and who is let in, sessions that outlive connections, cancel on disconnect, heartbeats and silence, routing, rejects, protocol violations, connection limits, all over real TCP |
 | `feed_test.cpp` | Sequencing, batching, heartbeats, gaps, retransmission, giving up, and a book rebuilt across a real socket |
 | `full_stack_test.cpp` | Shard, gateway and publisher threads together, with clients on TCP and a subscriber on UDP |
 | `journal_thread_test.cpp` | Shard on one thread and recorder on another: every command reaches the file, in order |
@@ -101,7 +101,9 @@ restarts it from the journal and checks that the feed carried over and that
 the orders left by the crash were cancelled. It also checks that a client
 that leaves has its orders cancelled. The venue runs with a clients file,
 and the test checks that a wrong token and an unlisted client are turned
-away.
+away. Last, it opens a connection by hand, logs in and rests an order byte
+by byte, and then says nothing: the venue must drop it and cancel the
+order, while a real client that is merely quiet stays.
 `bench_smoke.sh` runs both benchmark programs and
 checks that their figures add up.
 
@@ -112,7 +114,7 @@ checks that their figures add up.
 | `reference_book.hpp` | `ReferenceBook`, the slow and obviously correct order book |
 | `feed_auditor.hpp` | `FeedAuditor`, and `RandomFlow`, which produces plausible and implausible commands, sessions closing among them |
 | `shard_harness.hpp` | `small_shard()`, `new_order()`, `cancel_order()`, `session_closed()`, and `as<T>()` to decode what a shard emitted |
-| `wire_client.hpp` | `WireClient`, a minimal order entry client over TCP that never blocks |
+| `wire_client.hpp` | `WireClient`, a minimal order entry client over TCP that never blocks. It sends no heartbeats, so tests that want a timeout say so. |
 | `fixtures.hpp` | `TradeLog`, and `scaled()` for `PLANCK_TEST_SCALE` |
 | `temp_dir.hpp` | `TempDir`, a directory removed when the test ends |
 
@@ -124,7 +126,7 @@ at a time in a private copy of the repository, rebuilds, and confirms that
 a test fails.
 
 ```bash
-tools/seeded_bugs.py                # all 80, about 35 minutes on two CPUs
+tools/seeded_bugs.py                # all 95, about 40 minutes on two CPUs
 tools/seeded_bugs.py --only capi    # the ones whose label matches
 tools/seeded_bugs.py --list
 ```
@@ -140,9 +142,9 @@ the bug back. `tools_selftest` checks on every test run that each entry's
 pattern still occurs exactly once in the source, so the catalogue cannot
 silently rot.
 
-The catalogue is lopsided: 39 of its 80 entries are in `capi/` and `bench/`,
-12 are from the session work in `gateway/` and 24 are for cancel on
-disconnect (W-51). Backfilling the
+The catalogue is lopsided: 39 of its 95 entries are in `capi/` and `bench/`,
+12 are from the session work in `gateway/`, 24 are for cancel on disconnect
+and 15 for heartbeats and silence (W-51). Backfilling the
 older modules is open work.
 
 ## What is expected of new code
@@ -157,7 +159,10 @@ older modules is open work.
 4. **No sleeps to wait for something.** Poll for the condition with a
    generous limit. A fixed sleep is either too short on a busy machine or
    too long everywhere. See `eventually()` in `net_test.cpp` and
-   `captured()` in `feed_test.cpp`.
+   `captured()` in `feed_test.cpp`. And where the code under test measures
+   time, give it a clock the test controls: see `GatewayTimers` in
+   `gateway_test.cpp`, which tests timeouts of half a second in no time at
+   all.
 5. **Pass in all of `scripts/check_all.sh`**, and survive
    `--repeat until-fail:10 -j 12` if threads or sockets are involved.
 6. **A seeded bug** for anything subtle.

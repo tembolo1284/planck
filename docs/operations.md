@@ -21,6 +21,8 @@ planckd [options]
 | `--band-ticks N` | 65536 | Prices per symbol. A power of two, 64 to 262144. |
 | `--orders N` | 1048576 | Resting orders per shard |
 | `--clients FILE` | off | Who may log in. Without it anyone may, as any client id. See "Clients" below. |
+| `--heartbeat MS` | 1000 | Send a heartbeat to a client that has been sent nothing for this long. 0 never does. |
+| `--idle-timeout MS` | 5000 | End a connection nothing has been heard on for this long, and cancel its orders. Longer than `--heartbeat`. 0 never does, and is the only value allowed with `--heartbeat 0`. |
 | `--journal DIRECTORY` | off | Record every command, and rebuild from it at startup |
 | `--journal-sync MS` | 10 | Longest a command may wait to reach the disk. 0 syncs after every write. |
 | `--cpus LIST` | none | Pin threads, for example `2-5` or `2,4,6,8` |
@@ -41,6 +43,7 @@ feed stream 0 -> 127.0.0.1:30001
 feed stream 1 -> 127.0.0.1:30002
 order entry on 0.0.0.0:9000
 clients: 12 listed in /etc/planck/clients
+clients: one heard nothing from for 5000 ms is disconnected
 retransmit requests on 0.0.0.0:30000
 journal in /var/planck, synced within 10 ms
 shard 0 replayed 18234 commands
@@ -104,11 +107,25 @@ A venue never leaves a client's orders working behind its back (S-27).
 - A client that reconnects is the same session and starts with nothing
   resting. It is not told what happened while it was away (W-04).
 
-There is no flag for this. Two limits to know:
+There is no flag for this. A connection ends in one of three ways:
 
-- A disconnect is noticed when the kernel reports the connection closed. A
-  line that goes dead without closing is not noticed, and those orders stay
-  (W-03).
+- The client closes it or logs out, or the kernel reports it broken.
+- The venue drops it: for bytes that are not the protocol, or for not
+  reading its reports.
+- Nothing is heard on it for `--idle-timeout`. This is how a line that died
+  without closing is noticed. Every client is told the timeout when it logs
+  in and is expected to send heartbeats well inside it. `planck-client`
+  does so by itself. Watch `idle_timeouts` in the counters.
+
+Choosing `--idle-timeout`: it is how long a dead client's orders can go on
+trading, so shorter is safer. But a client on a poor line can go silent for
+seconds while TCP resends, and dropping it cancels its orders. Five seconds
+suits home and office internet. On a private network one or two seconds is
+usual. The gateway judges silence only while it is running itself: if it
+was held up for 100 ms or more, every connection gets a fresh start.
+
+One limit to know:
+
 - All of a client's orders are cancelled in one go, and the shard does
   nothing else meanwhile. A client with hundreds of thousands of orders
   resting makes everyone on its shards wait when it leaves (W-25).
@@ -149,7 +166,7 @@ stats engine  commands accepted rejected trades cancels disconnect_cancels
               resting stalls
 stats gateway sessions connections logins messages rejected busy reports
               dropped protocol_errors slow_consumers bad_credentials
-              session_closes
+              session_closes heartbeats idle_timeouts login_timeouts
 stats feed    messages datagrams heartbeats send_failures retransmit_requests
               retransmitted refused
 stats latency reports p50_ns p99_ns p999_ns max_ns
@@ -165,6 +182,8 @@ What to watch:
 | `engine disconnect_cancels` | Orders cancelled because their client's connection ended, or the venue started. Not included in `cancels`. |
 | `engine commands` | Counts sessions closing as well as orders and cancels. One per shard for each client that leaves, and one per shard at each start. |
 | `gateway dropped` | Reports for clients that had no connection at the time. Each order cancelled by a disconnect adds one. |
+| `gateway idle_timeouts` | Connections ended because nothing was heard on them. Each is a client whose line or program died, or one that does not send heartbeats. A burst of them at once points at the network, or at a timeout set too short. |
+| `gateway login_timeouts` | Connections that kept talking but never logged in. |
 | `gateway session_closes` | Times a shard was told that a client had gone: the number of shards for each logged-in connection that ended. |
 | `gateway bad_credentials` | Logins refused: not listed, or the wrong token. A steady climb is someone guessing. |
 | `gateway slow_consumers` | Clients disconnected for not reading their reports (D-03) |
@@ -236,6 +255,10 @@ planck-client [--connect ADDRESS:PORT] [--client-id N] [--token N] [--linger MS]
                defaults: 127.0.0.1:9000, 1, 0, 200
 ```
 
+It sends heartbeats by itself, as often as the venue's timeout calls for,
+and gives up if it hears nothing from the venue for twice that timeout.
+`ping` sends one at once. The venue does not answer it.
+
 ```
 buy  SYMBOL QTY PRICE [day|ioc|fok]
 sell SYMBOL QTY PRICE [day|ioc|fok]
@@ -301,6 +324,5 @@ See [benchmarks.md](benchmarks.md).
 
 Before putting this in front of anyone, read the Gateway, Feed, Journal and
 Programs sections of [weaknesses.md](weaknesses.md). In short: a login
-token sent in the clear, no heartbeats or idle timeout, so a dead line is
-not noticed, no report recovery, no feed snapshots, an unprotected retransmit port, asynchronous
+token sent in the clear, no report recovery, no feed snapshots, an unprotected retransmit port, asynchronous
 durability, no clean shutdown for clients, and no monitoring beyond stdout.

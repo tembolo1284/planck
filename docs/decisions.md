@@ -15,7 +15,8 @@ these documents brought up to date.
 |-----:|------|--------|-------|
 | 1 | Sessions that outlive connections, and a list of who may log in | D-02, W-02, W-05 | done: S-23, S-24 |
 | 2 | Cancel on disconnect, and at restart | D-01, D-14, W-01 | done: S-27, S-28 |
-| 3 | Heartbeats, report sequence numbers, report recovery, idempotent orders | W-03, W-04, D-18 | next |
+| 3a | Heartbeats, and dropping a connection that has gone silent | W-03 | done: S-31, S-32 |
+| 3b | Report sequence numbers, report recovery, idempotent orders | W-04, D-18 | next |
 | 4 | A commit boundary: nothing is told to anyone before it is durable. Measure the cost first. | D-12, D-13, W-70, W-71, W-80 | |
 | 5 | Feed snapshots and a separate, rate-limited recovery service | D-05, W-10, W-11, W-13 | |
 | 6 | A failed market data consumer must not stop matching | W-21 | |
@@ -152,3 +153,5 @@ of its own.
 | S-28 | A venue that starts cancels every resting order. The gateway opens by telling each shard that all sessions are closed, as one journaled command, before it accepts a connection. (Was D-14.) | A restart is a disconnect of everyone. The journal still rebuilds the books first, so the feed shows each order leaving and subscribers stay in step. |
 | S-29 | The list of each session's resting orders is kept by the shard, beside the order store, and only in a shard asked to cancel on disconnect (`ShardConfig::cancel_on_disconnect`). `planckd` always asks. The book knows nothing of it. | The order stays at half a cache line and the book stays free of sessions. A shard that is not a venue, in a benchmark or behind the C interface, pays nothing. |
 | S-30 | Journal format 3: two more kinds of record, for one session closing and for all of them. Formats 1 and 2 are refused. | A format 2 reader would stop at the new records, and a format 2 journal was written by shards that kept orders, so it would rebuild books that this venue would never have had. |
+| S-31 | Silence ends a connection. The venue drops a connection it has heard nothing on for its idle timeout (five seconds by default), and one that has not logged in by then. It tells each client the timeout at login. It sends a heartbeat to any client it has sent nothing else for its heartbeat interval (one second by default). A venue that drops silent clients may not be silent itself. The gateway judges silence by its own clock and only while it is itself running. (Was W-03.) | Without it a line that dies quietly is never noticed, and cancel on disconnect does nothing in exactly the case it is for. Telling the client the timeout means no client has to guess. Giving everyone a fresh start after the gateway was held up means a pause of the venue's own cannot cancel every order in the book. |
+| S-32 | Nobody answers a heartbeat. Order entry protocol version 2. | Two ends that both answered would never stop, and one that answers gives a stranger a way to make the venue send. A heartbeat's arrival is the whole of its meaning. Version 1 clients expected an echo, so they are refused. |

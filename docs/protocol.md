@@ -8,7 +8,7 @@ and offset given here.
 
 ## Common rules
 
-- Protocol version 1.
+- Protocol version 2. A client that logs in with any other is refused.
 - Every integer is little-endian. There is no padding inside a message.
 - Reserved bytes must be zero when sent. The venue rejects a client message
   whose reserved bytes are not zero.
@@ -47,9 +47,29 @@ at a time.
 4. Client sends `Logout` or just closes.
 
 An order or cancel before step 2 is answered with `OrderRejected` or
-`CancelRejected`, reason NotLoggedIn. A `Heartbeat` from the client is
-echoed. The venue sends none of its own and never times a client out
-(W-03).
+`CancelRejected`, reason NotLoggedIn.
+
+### Heartbeats and silence
+
+A TCP connection can die without either end being told. So each side
+speaks up when it has had nothing else to say, and each gives up on a line
+it has heard nothing on for too long.
+
+- **Neither side answers a `Heartbeat`.** It is not a ping. Two ends that
+  both answered would never stop.
+- **The venue** sends a `Heartbeat` to a logged-in client it has sent
+  nothing else for its heartbeat interval, one second by default.
+- **The venue ends a connection** it has heard nothing on for its idle
+  timeout, five seconds by default. Anything the client sends counts. The
+  timeout is in `LoginAccepted`, in milliseconds. Zero means the venue
+  never does this.
+- **A client** should send something, a `Heartbeat` if nothing else, about
+  three times in each timeout. A client that hears nothing at all from the
+  venue for two timeouts should take the venue for dead.
+- **A connection has one timeout to log in**, whatever else it sends.
+
+Being dropped for silence is a disconnect like any other: the session's
+resting orders are cancelled.
 
 **When a connection ends**, every order its session has resting is
 cancelled. It does not matter how it ends: a `Logout`, a close, a broken
@@ -69,8 +89,8 @@ the venue finishes closing its last connection: try again.
 A venue that restarts cancels every resting order before it accepts a
 connection (S-28).
 
-A line that dies without closing is not noticed, and those orders stay
-(W-03).
+A line that dies without closing is noticed by the silence on it, as
+described above, and treated the same way.
 
 The token is sent in the clear. Order entry belongs on a private link
 (S-23, W-08).
@@ -87,7 +107,8 @@ The token is sent in the clear. Order entry belongs on a private link
 | 12 | 4 | reserved | |
 | 16 | 8 | `token` | The secret the venue holds for this client id. Ignored by a venue started without `--clients`. |
 
-**Heartbeat**, type 0x04, 4 bytes. Header only. Echoed.
+**Heartbeat**, type 0x04, 4 bytes. Header only. Either side may send it.
+Nobody answers it.
 
 **Logout**, type 0x05, 4 bytes. Header only.
 
@@ -118,7 +139,7 @@ The token is sent in the clear. Order entry belongs on a private link
 | Offset | Size | Field | Meaning |
 |-------:|-----:|-------|---------|
 | 4 | 2 | `session_id` | The client id you logged in with |
-| 6 | 2 | reserved | |
+| 6 | 2 | `idle_timeout_ms` | The venue ends a connection it hears nothing on for this long. 0: it never does. |
 
 **LoginRejected**, type 0x03, 8 bytes
 
@@ -369,3 +390,8 @@ a change too, and took it to version 3. Then:
 3. For the journal, decide what happens to old files. There is no migration
    tool (W-74).
 4. If the C library's structs change, bump `PLANCK_ABI_VERSION` too.
+
+The order entry protocol went to version 2 when heartbeats stopped being
+answered and `LoginAccepted` gained the idle timeout. The second of those
+used bytes that were reserved, so no size changed. The first changed what
+a correct client does, and that is a new version however small it looks.

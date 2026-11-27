@@ -138,6 +138,18 @@ TEST(GatewayConfigTest, RejectsBadConfigurations) {
     EXPECT_EQ(init_with([](GatewayConfig& c) { c.shards = {}; }), Status::InvalidArgument);
     EXPECT_EQ(init_with([](GatewayConfig& c) { c.max_sessions = 0; }), Status::InvalidArgument);
     EXPECT_EQ(init_with([](GatewayConfig& c) { c.tx_buffer_bytes = 8; }), Status::InvalidArgument);
+    const auto timers = [&](std::uint32_t heartbeat, std::uint32_t timeout) {
+        return init_with([=](GatewayConfig& c) {
+            c.heartbeat_interval_ms = heartbeat;
+            c.idle_timeout_ms = timeout;
+        });
+    };
+    EXPECT_EQ(timers(100, 100), Status::InvalidArgument) << "no time left to answer in";
+    EXPECT_EQ(timers(100, 50), Status::InvalidArgument);
+    EXPECT_EQ(timers(0, 500), Status::InvalidArgument)
+        << "a venue that drops silent clients may not be silent itself";
+    EXPECT_EQ(timers(100, 65'536), Status::OutOfRange) << "the client is told it in 16 bits";
+    EXPECT_EQ(timers(65'536, 0), Status::OutOfRange);
     EXPECT_EQ(init_with([&](GatewayConfig& c) { c.shards = twice; }), Status::Duplicate);
     EXPECT_EQ(init_with([&](GatewayConfig& c) { c.shards = cold; }), Status::InvalidArgument);
     EXPECT_EQ(init_with([](GatewayConfig& c) { c.routes = kWrongShard; }), Status::OutOfRange);
@@ -416,16 +428,214 @@ TEST_F(GatewayTest, WithAClientListOnlyTheRightTokenGetsIn) {
     EXPECT_EQ(seven->expect<wire::OrderAccepted>().client_order_id, 2U);
 }
 
-TEST_F(GatewayTest, HeartbeatIsEchoedAndLogoutCloses) {
+TEST_F(GatewayTest, AHeartbeatIsNotAnsweredAndLogoutCloses) {
     const auto alice = client();
     alice->login(1);
     alice->send(wire::Heartbeat{});
-    static_cast<void>(alice->expect<wire::Heartbeat>());
+    alice->send(wire::Heartbeat{});
+    EXPECT_TRUE(alice->quiet()) << "two ends that both answered heartbeats would never stop";
+    EXPECT_EQ(gateway_->stats().heartbeats_in, 2U);
+    EXPECT_EQ(gateway_->active_sessions(), 1U);
 
     alice->send(wire::Logout{});
     EXPECT_TRUE(alice->closed_by_server());
     EXPECT_EQ(gateway_->active_sessions(), 0U);
     EXPECT_EQ(gateway_->stats().protocol_errors, 0U) << "a logout is not an error";
+}
+
+// The time the gateway is told it is, for the tests about silence. Real
+// time would make them slow, and wrong on a busy machine.
+std::uint64_t g_now_ns = 1'000'000'000;
+std::uint64_t test_clock() noexcept { return g_now_ns; }
+
+class GatewayTimers : public GatewayTest {
+protected:
+    static constexpr std::uint32_t kHeartbeatMs = 100;
+    static constexpr std::uint32_t kTimeoutMs = 500;
+
+    void SetUp() override {
+        cancel_on_disconnect_ = true;
+        GatewayConfig config;
+        config.heartbeat_interval_ms = kHeartbeatMs;
+        config.idle_timeout_ms = kTimeoutMs;
+        config.clock = test_clock;
+        start(config);
+    }
+
+    // Let time pass a little at a time with the gateway running, as it
+    // would. A jump of 100 ms or more would look to the gateway like a
+    // pause of its own.
+    void pass(std::uint32_t ms) {
+        for (std::uint32_t done = 0; done < ms; done += 10) {
+            g_now_ns += 10'000'000;
+            pump();
+        }
+    }
+
+    // Read every heartbeat waiting for this client and count them.
+    static std::size_t heartbeats(WireClient& client) {
+        std::size_t count = 0;
+        while (client.pending<wire::Heartbeat>()) {
+            static_cast<void>(client.expect<wire::Heartbeat>());
+            ++count;
+        }
+        return count;
+    }
+};
+
+TEST_F(GatewayTimers, TheClientIsToldHowLongItMayBeSilent) {
+    const auto alice = client();
+    wire::LoginRequest request{};
+    request.client_id = 1;
+    alice->send(request);
+    EXPECT_EQ(alice->expect<wire::LoginAccepted>().idle_timeout_ms, kTimeoutMs);
+
+    start({});  // and a gateway without a timeout says so
+    const auto bob = client();
+    bob->send(request);
+    EXPECT_EQ(bob->expect<wire::LoginAccepted>().idle_timeout_ms, 0);
+}
+
+TEST_F(GatewayTimers, ASilentClientIsDroppedAndItsOrdersCancelled) {
+    const auto silent = client();
+    silent->login(1);
+    silent->send(limit(3, core::Side::Buy, 950, 1, 1));
+    static_cast<void>(silent->expect<wire::OrderAccepted>());
+    const auto lively = client();
+    lively->login(2);
+
+    // Just short of the limit it is still there. The other client keeps
+    // talking throughout.
+    for (std::uint32_t waited = 0; waited < kTimeoutMs - 50; waited += 50) {
+        pass(50);
+        lively->send(wire::Heartbeat{});
+    }
+    pump();
+    EXPECT_EQ(gateway_->active_sessions(), 2U) << "dropped before its time was up";
+    EXPECT_EQ(gateway_->stats().idle_timeouts, 0U);
+
+    for (int i = 0; i < 4; ++i) {
+        pass(50);
+        lively->send(wire::Heartbeat{});
+    }
+    pump();
+    EXPECT_EQ(gateway_->stats().idle_timeouts, 1U);
+    EXPECT_EQ(gateway_->active_sessions(), 1U) << "the client that kept talking must stay";
+    EXPECT_TRUE(silent->closed_by_server());
+    EXPECT_EQ(shards_[0]->stats().disconnect_cancels, 1U)
+        << "a dead line is a disconnect like any other";
+    EXPECT_EQ(shards_[0]->store().in_use(), 0U);
+}
+
+TEST_F(GatewayTimers, AnythingAClientSendsCountsAsBeingHeard) {
+    const auto alice = client();
+    alice->login(1);
+    for (int i = 0; i < 12; ++i) {  // well over two timeouts in all
+        pass(kTimeoutMs / 5);
+        if (i % 2 == 0) {
+            alice->send(limit(3, core::Side::Buy, 5000, 1, 1));  // rejected, but heard
+        } else {
+            alice->send(wire::Heartbeat{});
+        }
+        pump();
+    }
+    EXPECT_EQ(gateway_->stats().idle_timeouts, 0U);
+    EXPECT_EQ(gateway_->active_sessions(), 1U);
+}
+
+TEST_F(GatewayTimers, AQuietClientIsSentHeartbeats) {
+    const auto alice = client();
+    alice->login(1);
+    EXPECT_EQ(heartbeats(*alice), 0U) << "a heartbeat right behind the login answer";
+
+    // It keeps itself alive with one message, and is sent nothing else.
+    pass(kHeartbeatMs / 2);
+    EXPECT_EQ(heartbeats(*alice), 0U) << "a heartbeat before the venue had been quiet long enough";
+    pass(kHeartbeatMs);
+    EXPECT_EQ(heartbeats(*alice), 1U);
+    alice->send(wire::Heartbeat{});
+    pass(3 * kHeartbeatMs);
+    const std::size_t more = heartbeats(*alice);
+    EXPECT_GE(more, 2U);
+    EXPECT_LE(more, 3U) << "about one for each interval, and no more";
+    EXPECT_EQ(gateway_->stats().heartbeats_out, 1 + more);
+}
+
+TEST_F(GatewayTimers, AClientThatIsBeingToldThingsIsNotSentHeartbeatsToo) {
+    const auto alice = client();
+    alice->login(1);
+    for (int i = 0; i < 10; ++i) {
+        pass(kHeartbeatMs / 2);
+        alice->send(limit(3, core::Side::Buy, 5000, 1, 1));
+        EXPECT_EQ(alice->expect<wire::OrderRejected>().reason, wire::RejectCode::PriceOutOfBand);
+    }
+    EXPECT_EQ(gateway_->stats().heartbeats_out, 0U);
+    EXPECT_TRUE(alice->quiet());
+}
+
+TEST_F(GatewayTimers, AConnectionMustLogInInTimeWhateverElseItSays) {
+    const auto chatty = client();
+    const auto mute = client();
+    for (std::uint32_t waited = 0; waited < kTimeoutMs - 50; waited += 50) {
+        pass(50);
+        chatty->send(wire::Heartbeat{});
+    }
+    pump();
+    EXPECT_EQ(gateway_->active_sessions(), 2U);
+    pass(150);
+    EXPECT_TRUE(chatty->closed_by_server()) << "talking is not logging in";
+    EXPECT_TRUE(mute->closed_by_server());
+    EXPECT_EQ(gateway_->stats().login_timeouts, 1U);
+    EXPECT_EQ(gateway_->stats().idle_timeouts, 1U);
+    EXPECT_EQ(gateway_->stats().heartbeats_out, 0U) << "heartbeats are for clients, not strangers";
+    EXPECT_EQ(gateway_->stats().session_closes, 0U) << "neither was ever a session";
+}
+
+TEST_F(GatewayTimers, AGatewayThatWasHeldUpDoesNotBlameItsClients) {
+    const auto alice = client();
+    alice->login(1);
+    alice->send(limit(3, core::Side::Buy, 950, 1, 1));
+    static_cast<void>(alice->expect<wire::OrderAccepted>());
+    const auto stranger = client();
+    pump();
+    ASSERT_EQ(gateway_->active_sessions(), 2U);
+
+    // Ten timeouts go by in one step: the gateway was not running. Whatever
+    // its clients sent meanwhile it has not read yet.
+    g_now_ns += std::uint64_t{10} * kTimeoutMs * 1'000'000;
+    for (int i = 0; i < 20; ++i) {
+        pump();
+    }
+    EXPECT_EQ(gateway_->stats().idle_timeouts, 0U);
+    EXPECT_EQ(gateway_->stats().login_timeouts, 0U);
+    EXPECT_EQ(gateway_->active_sessions(), 2U);
+    EXPECT_EQ(shards_[0]->store().in_use(), 1U);
+
+    // From there the usual rule applies again, counted from the pause.
+    pass(kTimeoutMs - 100);
+    EXPECT_EQ(gateway_->active_sessions(), 2U);
+    pass(200);
+    EXPECT_EQ(gateway_->stats().idle_timeouts, 2U);
+    EXPECT_EQ(gateway_->active_sessions(), 0U);
+    EXPECT_EQ(shards_[0]->store().in_use(), 0U);
+}
+
+TEST_F(GatewayTest, WithoutTimersSilenceIsAllowedForEver) {
+    GatewayConfig config;
+    config.clock = test_clock;
+    start(config);
+    const auto alice = client();
+    alice->login(1);
+    for (int i = 0; i < 50; ++i) {
+        g_now_ns += 50'000'000;
+        pump();
+    }
+    g_now_ns += 3'600'000'000'000;
+    pump();
+    EXPECT_EQ(gateway_->active_sessions(), 1U);
+    EXPECT_TRUE(alice->quiet());
+    EXPECT_EQ(gateway_->stats().idle_timeouts, 0U);
+    EXPECT_EQ(gateway_->stats().heartbeats_out, 0U);
 }
 
 TEST_F(GatewayTest, FullCommandRingIsReportedAsBusy) {
@@ -576,8 +786,8 @@ TEST_F(GatewayTest, EveryWayOfLeavingCancels) {
 
     // A connection that never logged in is no session and closes nothing.
     auto nobody = client();
-    nobody->send(wire::Heartbeat{});
-    static_cast<void>(nobody->expect<wire::Heartbeat>());
+    nobody->send(limit(3, core::Side::Buy, 950, 1, 1));
+    static_cast<void>(nobody->expect<wire::OrderRejected>());
     nobody->close();
     wait_until_nobody_is_connected();
     const auto refused = client();

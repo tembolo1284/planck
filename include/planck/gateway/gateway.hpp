@@ -42,6 +42,21 @@ struct GatewayConfig {
     // and disconnected.
     std::uint32_t tx_buffer_bytes = 64U << 10;
 
+    // Send a Heartbeat to a logged-in client that has been sent nothing for
+    // this long, so it can tell a quiet venue from a dead one. Zero: never.
+    std::uint32_t heartbeat_interval_ms = 0;
+    // End a connection that nothing has been heard on for this long. That
+    // is how a line that died without closing is noticed, and its session's
+    // orders cancelled. A connection also has this long to log in, whatever
+    // it sends meanwhile. Zero: never. Otherwise heartbeats must be on and
+    // this must be longer than their interval, and at most kMaxIdleTimeoutMs
+    // because the client is told it in sixteen bits.
+    std::uint32_t idle_timeout_ms = 0;
+    // Where the gateway reads the time, in nanoseconds that never go
+    // backwards. Null for the system's monotonic clock. Tests pass their own
+    // so that they need not wait for real time to pass.
+    std::uint64_t (*clock)() noexcept = nullptr;
+
     // Who may log in. If null, any client id from 1 to 65,535 may, and the
     // token is ignored: fine for tests and a closed lab, nowhere else. The
     // table must outlive the gateway and must not change while it runs.
@@ -78,6 +93,14 @@ struct GatewayStats {
     // Subset of session_closes that could not be sent at once, because the
     // shard's command ring was full, and went out on a later pass.
     std::uint64_t session_closes_delayed = 0;
+    // Heartbeats sent to clients that had been sent nothing else, and
+    // heartbeats received.
+    std::uint64_t heartbeats_out = 0;
+    std::uint64_t heartbeats_in = 0;
+    // Connections ended because nothing was heard on them for too long.
+    std::uint64_t idle_timeouts = 0;
+    // Connections ended because they did not log in soon enough.
+    std::uint64_t login_timeouts = 0;
     // Reports for a session that had no connection at the time.
     std::uint64_t reports_dropped = 0;
     // Connections dropped for sending bytes that are not the protocol.
@@ -115,12 +138,23 @@ struct GatewayStats {
 // A client that reconnects is the same owner as before. Reports produced
 // while it had no connection are dropped and counted.
 //
+// A line can die without the kernel ever saying so. So, if configured to,
+// the gateway ends any connection it has heard nothing on for too long,
+// and sends a Heartbeat to any client it has had nothing else to say to.
+// It judges silence by its own clock, and only while it is itself running:
+// after a pause of its own it gives everyone a fresh start, since whatever
+// they sent meanwhile is still waiting to be read.
+//
 // Lifecycle matches Shard: construct anywhere, init() on the thread that
 // will run it, then run() or poll().
 class Gateway {
 public:
     static constexpr std::size_t kRxBufferBytes = 4096;
     static constexpr std::uint32_t kMaxSessionId = 0xFFFF;
+    static constexpr std::uint32_t kMaxIdleTimeoutMs = 0xFFFF;
+    // A gap this long between two passes means the gateway itself was held
+    // up, and nobody is blamed for the silence.
+    static constexpr std::uint64_t kOwnPauseNs = 100'000'000;
 
     Gateway() noexcept = default;
     Gateway(const Gateway&) = delete;
@@ -152,6 +186,11 @@ private:
         bool dirty = false;    // has bytes waiting in tx
         std::uint32_t rx_length = 0;
         std::uint32_t tx_length = 0;
+        // When it connected, when bytes last arrived on it, and when
+        // something was last queued for it. On the gateway's clock.
+        std::uint64_t opened_ns = 0;
+        std::uint64_t heard_ns = 0;
+        std::uint64_t sent_ns = 0;
         std::byte* rx = nullptr;
         std::byte* tx = nullptr;
     };
@@ -176,6 +215,11 @@ private:
         const std::uint16_t slot = slot_by_session_[session.raw()];
         return (slot == kNoConnection) ? nullptr : &connections_[slot];
     }
+
+    // Read the clock, and every so often look for connections that have
+    // gone silent and clients that are due a heartbeat.
+    void keep_time() noexcept;
+    void check_connections() noexcept;
 
     // Tell every shard that a session has lost its connection.
     void close_session(core::SessionId session) noexcept;
@@ -217,6 +261,15 @@ private:
     net::Poller poller_{};
     std::span<engine::Shard* const> shards_{};
     const Credentials* credentials_ = nullptr;
+    std::uint64_t (*clock_)() noexcept = nullptr;
+    // Zero means off, for both.
+    std::uint64_t heartbeat_ns_ = 0;
+    std::uint64_t idle_timeout_ns_ = 0;
+    std::uint16_t idle_timeout_ms_ = 0;
+    // The time as of this pass, and when connections are next looked over.
+    std::uint64_t now_ns_ = 0;
+    std::uint64_t next_check_ns_ = 0;
+    std::uint64_t check_every_ns_ = 0;
     std::size_t next_slot_ = 0;
     perf::Histogram* latency_ = nullptr;
     std::uint32_t active_ = 0;

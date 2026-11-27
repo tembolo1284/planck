@@ -10,7 +10,8 @@
 # from its journal, and checks that the feed carried over, that the orders
 # left resting by the crash are cancelled, and that sessions are still the
 # same clients. The venue runs with a clients file throughout, so who may
-# log in is checked as well.
+# log in is checked as well. Last, a client whose line goes dead without
+# closing must be noticed and its order cancelled.
 set -u
 
 bin="${1:?usage: apps_smoke.sh <bin directory>}"
@@ -68,13 +69,16 @@ start_venue() {
     "$bin/planckd" --clients "$work/clients" --listen "127.0.0.1:$order_port" \
         --feed "127.0.0.1:$quiet_feed_port" \
         --retransmit "127.0.0.1:$retransmit_port" --shards 2 --symbols 4 --orders 4096 \
-        --huge off --journal "$work/journal" > "$work/$1" 2>&1 &
+        --huge off --journal "$work/journal" --heartbeat 400 --idle-timeout 2000 \
+        > "$work/$1" 2>&1 &
     venue_pid=$!
     wait_for "$1" '^ready$'
 }
 start_venue venue.log
 expect venue.log '^shard 1 replayed 0 commands$' "a first start found something to replay"
 expect venue.log '^clients: 3 listed in ' "the venue did not read its clients file"
+expect venue.log '^clients: one heard nothing from for 2000 ms is disconnected$' \
+    "the venue did not take its idle timeout"
 
 # A live subscriber, there from the first message.
 "$bin/planck-mdtap" --stream 1 --listen "127.0.0.1:$feed_port" --count 4 \
@@ -186,6 +190,18 @@ start_venue venue2.log
 expect venue2.log '^shard 1 replayed 7 commands$' "shard 1 was not rebuilt from its journal"
 expect venue2.log '^shard 0 replayed 3 commands$' "shard 0 was not rebuilt from its journal"
 
+# A client whose line goes dead. It logs in as client 2 and rests an order
+# in symbol 2, by hand, byte by byte, and then says nothing more: no logout,
+# no close, no heartbeat. The connection stays open until the end of this
+# script. The venue must give up on it by itself.
+exec 9<>"/dev/tcp/127.0.0.1/$order_port" || fail "could not open a raw connection"
+# LoginRequest: length 24, type 1, protocol 2, client 2, token 2002.
+printf '\x18\x00\x01\x00\x02\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00' >&9
+printf '\xd2\x07\x00\x00\x00\x00\x00\x00' >&9
+# NewOrder: length 32, type 0x10, symbol 2, buy, limit, id 1, price 400, qty 5, day.
+printf '\x20\x00\x10\x00\x02\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00' >&9
+printf '\x90\x01\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' >&9
+
 # The maker's order had 6 left when the venue died, and the journal brought
 # it back. But nobody is connected to a venue that has just started, so it
 # was cancelled before the first client could log in. The maker comes back
@@ -201,16 +217,16 @@ expect maker2.log '^logged in client_id=1 session=1$' "a session id must be the 
 expect maker2.log "^cancel rejected order_id=$maker_order reason=UnknownOrder\$" \
     "an order from before the restart was still there to cancel"
 
-# Another client trades with the new order and rests what is left over.
+# Another client trades with the new order and rests what is left over. It
+# is told to stay until the venue has been quiet for a second, which is
+# longer than the venue goes between heartbeats: they must not keep it.
 printf 'buy 1 6 1000\n' |
-    "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 3 --token 3003 \
-    > "$work/after.log" 2>&1 || fail "the client exited with an error after the restart"
+    timeout 10 "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 3 \
+    --token 3003 --linger 1000 \
+    > "$work/after.log" 2>&1 || fail "the client did not leave, or left with an error"
 expect after.log '^executed .* qty=2 price=1000 leaves=4 taker ' \
     "only the 2 offered after the restart may trade, not the 6 from before it"
 wait_for maker2.log '^executed .* qty=2 price=1000 leaves=0 maker '
-kill "$maker_pid" 2>/dev/null || true
-wait "$maker_pid" 2>/dev/null || true
-maker_pid=""
 
 # A subscriber replaying from the start sees the first life's messages
 # exactly as they were. Then the restart's cancel, the new order, the trade,
@@ -231,14 +247,30 @@ expect reborn.log '^7 trade symbol=1 qty=2 price=1000 ' "the trade after the res
 expect reborn.log '^8 add symbol=1 buy qty=4 price=1000 ' "feed message 8 is wrong"
 expect reborn.log '^9 delete symbol=1 ' "the order of the client that left is still in the book"
 
-# Wait for the venue to have dealt with the maker leaving too: command 13
+# By now the silent client has had its two seconds. Stream 0 shows the
+# first life's order come and go, then the silent client's order arrive,
+# and then go, with nobody having said a word.
+timeout 20 "$bin/planck-mdtap" --stream 0 --listen "127.0.0.1:$quiet_feed_port" \
+    --retransmit "127.0.0.1:$retransmit_port" --from-start --count 4 \
+    > "$work/dead.log" 2>&1 || fail "the order of a client that went silent was never cancelled"
+expect dead.log '^3 add symbol=2 buy qty=5 price=400 ' "the silent client's order never rested"
+expect dead.log '^4 delete symbol=2 ' "the order of a client that went silent is still in the book"
+
+# The maker has been connected all that time with nothing to say, and is
+# still there: a real client sends heartbeats without being asked.
+kill -0 "$maker_pid" 2>/dev/null || fail "a quiet but living client was dropped"
+kill "$maker_pid" 2>/dev/null || true
+wait "$maker_pid" 2>/dev/null || true
+maker_pid=""
+
+# Wait for the venue to have dealt with the maker leaving too: command 14
 # of shard 1, counting both lives.
 for _ in $(seq 1 100); do
     "$bin/planck-replay" --file "$work/journal/shard-01.journal" > "$work/replay2.log" 2>&1
-    grep -q '^commands=13 ' "$work/replay2.log" && break
+    grep -q '^commands=14 ' "$work/replay2.log" && break
     sleep 0.1
 done
-expect replay2.log '^commands=13 new_orders=6 cancels=2 closes=5 ' \
+expect replay2.log '^commands=14 new_orders=6 cancels=2 closes=6 ' \
     "the journal of shard 1 does not hold both lives"
 
 # Clean shutdown on SIGTERM, with final counters that match both lives.
@@ -246,11 +278,14 @@ kill -TERM "$venue_pid"
 wait "$venue_pid" || fail "the venue did not exit cleanly"
 venue_pid=""
 expect venue2.log '^stopping$' "the venue did not notice the signal"
-expect venue2.log '^stats engine commands=19 accepted=6 rejected=2 trades=2 cancels=1 disconnect_cancels=3 resting=0 ' \
+expect venue2.log '^stats engine commands=22 accepted=7 rejected=2 trades=2 cancels=1 disconnect_cancels=4 resting=0 ' \
     "the venue's final counters are wrong"
-expect venue2.log '^stats feed messages=11 ' "the venue's feed counters are wrong"
-expect venue2.log '^stats journal records=9 .* discarded=0 failed=0$' \
-    "the journal did not record the nine commands of the second life"
+expect venue2.log '^stats feed messages=13 ' "the venue's feed counters are wrong"
+expect venue2.log '^stats journal records=12 .* discarded=0 failed=0$' \
+    "the journal did not record the twelve commands of the second life"
+expect venue2.log '^stats gateway .* idle_timeouts=1 login_timeouts=0$' \
+    "the venue did not count the client it gave up on"
+exec 9>&-
 expect venue2.log '^stats latency reports=' "no latency was measured"
 
 echo "PASS"

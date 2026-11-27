@@ -22,7 +22,9 @@ namespace planck::wire {
 static_assert(std::endian::native == std::endian::little,
               "planck wire format is little-endian and does no byte swapping");
 
-inline constexpr std::uint16_t kProtocolVersion = 1;
+// Version 2: neither side answers a Heartbeat any more, and LoginAccepted
+// says how long the venue lets a client stay silent.
+inline constexpr std::uint16_t kProtocolVersion = 2;
 
 // Largest message in the protocol. Buffers of this size hold any message.
 inline constexpr std::size_t kMaxMessageSize = 48;

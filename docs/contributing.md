@@ -174,10 +174,12 @@ where it is weakest, and what is next. Ids point into
   stall another.
 - **Know first:** a session is not a connection (S-24). Read the comment
   above `class Gateway` before anything else.
-- **Weakest:** this is where most of the agreed plan lands. Next are W-03
-  heartbeats and an idle timeout, without which a dead line is never
-  noticed, and W-04 report recovery. Also W-08 (the token is sent in the
+- **Weakest:** this is where most of the agreed plan lands. Next is W-04,
+  report sequence numbers and recovery. Also W-08 (the token is sent in the
   clear) and W-61 clean shutdown.
+- **Testing time:** the gateway takes its clock from its configuration.
+  Tests about timeouts pass their own and step it. Do not write one that
+  sleeps.
 - **Never tested:** slow-consumer disconnect (W-40), anything over a real
   network (W-86).
 
@@ -232,10 +234,10 @@ where it is weakest, and what is next. Ids point into
 ## What to do next, in order
 
 The order was agreed on 2026-11-26 and is kept as the "Agreed plan" at the
-top of [decisions.md](decisions.md). Steps 1 and 2 are done. In short:
+top of [decisions.md](decisions.md). Steps 1 and 2 and the first half of
+step 3 are done. In short:
 
-1. Heartbeats, report sequence numbers and recovery, idempotent orders
-   (W-03, W-04).
+1. Report sequence numbers and recovery, idempotent orders (W-04).
 2. A commit boundary for reports and market data, after measuring the time
    to durable (D-12, D-13, W-80).
 3. Snapshots and a separate recovery service for the feed (D-05, W-10,
