@@ -1,0 +1,9 @@
+/* What libplanck.so offers to the outside: the functions in planck.h and
+ * nothing else. Everything the engine is made of stays private, so it can
+ * change without breaking a program linked against the library. */
+{
+    global:
+        planck_*;
+    local:
+        *;
+};

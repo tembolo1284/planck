@@ -69,7 +69,8 @@ Things that are simply broken or missing live in `weaknesses.md`.
 - **Alternative A:** group commit. Hold each report until the sync that covers its command. Nothing a client was told can be lost, at the cost of adding the sync time to every order.
 - **Alternative B:** replicate each command to a second machine before answering, and keep the disk asynchronous. This is what most fast venues do.
 - **Leaning:** keep asynchronous as the default, and add A as a switch for anyone who wants it. B is a project of its own.
-- **Touches:** W-70.
+- **Measured so far:** journaling costs the matching thread nothing visible (`shard.rest` against `shard.rest.journal` in `benchmarks.md`). What alternative A would add, the time for a command to reach the disk, is not measured yet.
+- **Touches:** W-70, W-80.
 
 ### D-13 What the venue does when its journal fails
 - **Today:** matching carries on and `planckd` prints an error. The journal stops describing the venue.
@@ -82,6 +83,21 @@ Things that are simply broken or missing live in `weaknesses.md`.
 - **Alternative:** cancel every resting order at restart, which many venues do, or let clients reclaim their orders after logging in again.
 - **Leaning:** settle together with D-01. They are the same question.
 - **Touches:** W-01.
+
+### D-15 How much of planck the C library covers
+- **Today:** the matching engine only. One shard on the caller's thread: submit, cancel, read reports and market events, query the book.
+- **Alternative A:** add the journal, so a C or Python program can record a run and replay it.
+- **Alternative B:** a whole venue behind the C interface, threads and sockets included, with start and stop calls.
+- **Alternative C:** a client library instead: the wire protocol's encode and decode, so other languages can talk to `planckd`.
+- **Leaning:** keep the engine as it is, add C when a client in another language is wanted. B has little point, since `planckd` is already a program anyone can run.
+- **Touches:** W-90.
+
+### D-16 How the C library hands back what happened
+- **Today:** the caller pulls. After each call it reads reports and market events from two queues until they are empty. No callbacks.
+- **Alternative:** the caller registers two functions and the engine calls them during the match.
+- **For pulling:** nothing calls back into foreign code from the middle of matching, which every binding generator can handle and which cannot re-enter the engine. **For callbacks:** no queues, so W-91's memory goes away.
+- **Leaning:** keep pulling as the default. Offer callbacks as a second mode if the memory matters to someone.
+- **Touches:** W-91.
 
 ## Settled
 
@@ -100,3 +116,9 @@ Things that are simply broken or missing live in `weaknesses.md`.
 | S-11 | `apps/` before `journal/`, `perf/`, `capi/` and `bench/`. | A venue that can be started and poked at makes everything after it easier to check. |
 | S-12 | The journal records commands, not their effects, and the shard writes it, not the gateway. | Matching is deterministic, so the inputs are enough to rebuild everything, and only the shard knows the order it handled them in and the time it gave each. |
 | S-13 | A torn record at the end of a journal is dropped at restart. Damage anywhere else stops the venue from starting. | The first is the normal mark of a crash. The second means history is missing, and a person should decide. |
+| S-14 | `bench/` before `capi/`. | Numbers first, so that nothing is frozen behind an interface before its cost is known. |
+| S-15 | The benchmarks use their own small harness on top of `perf::Histogram`, not Google Benchmark. | Google Benchmark reports an average time per operation. What matters here is the slow tail of single operations, which needs every sample kept. It is also one dependency fewer. |
+| S-16 | A fixed-rate load is measured against the time each order was due, as well as the time it was sent. | Otherwise a load generator slows down whenever the venue does and never sees the queue a real client would sit in (coordinated omission). |
+| S-17 | `libplanck.so` compiles the engine's sources a second time, as position independent code. The static libraries the venue links are not touched. | Position independence is needed for a shared library and is not free. The venue's hot path should not pay for a library it does not use. |
+| S-18 | `libplanck.so` exports the functions in `planck.h` and nothing else, and needs only the C library at run time. | Internals stay free to change. A C program does not have to load the C++ runtime. Both are checked by a test. |
+| S-19 | A caller's mistake (a null pointer, a side that is neither buy nor sell) comes back as a status and changes nothing. The market's refusal (unknown symbol, price outside the band, book full) comes back as a report. | The first is a bug in the calling program. The second is an ordinary event that a trading program has to handle anyway, the same way it would from the venue. |

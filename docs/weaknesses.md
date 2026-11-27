@@ -20,7 +20,7 @@ means a real operational gap. **low** means a rough edge.
 | W-04 | medium | Order entry has no sequence numbers and no replay. | Reports sent while a client was disconnected are gone. | Sequence the report stream per session and add a resend request. Needs the journal. |
 | W-05 | medium | Login checks only the protocol version and that the client id is not in use. | Anyone who can reach the port can trade as any free client id. | Depends on D-02. |
 | W-06 | low | One gateway thread serves every shard and every client. | It becomes the bottleneck before the shards do. | Several gateways, each owning a set of sessions. The rings are single producer, so this needs one command ring per gateway per shard. |
-| W-07 | low | A full command ring rejects the order as Busy at once. | A short burst turns into client-visible rejects. | Probably right as is. Revisit with numbers from `bench/`. |
+| W-07 | low | A full command ring rejects the order as Busy at once. | A short burst turns into client-visible rejects. | Probably right as is. `planck-loadgen` counts Busy rejects, so drive it at a fixed rate on real hardware and see how soon they start. |
 
 ## Feed
 
@@ -39,6 +39,8 @@ means a real operational gap. **low** means a rough edge.
 |----|----------|----------|----------------|-----|
 | W-21 | medium | A shard that cannot hand off its output stalls, and aborts the process after 2^34 spins. | One dead consumer takes the shard down with it. That is deliberate (it never drops a message), but there is no softer path. | Detect a dead consumer sooner and fail over, or shut down cleanly with a clear message. |
 | W-22 | low | Limits are compile-time constants: 16 shards, 4096 symbols, 1024 session slots. Order capacity and price bands are fixed at start. | Changing any of them means a rebuild or a restart. | Fine for now. List them in the README. |
+| W-23 | low | An order that may rest is given its slot before it is matched. When every slot is taken it is rejected as BookFull, even if it would have traded at once and freed more room than it needed. Orders that never rest (IOC, FOK, market) are not affected. | At the very limit of capacity the book turns away liquidity it could have matched. | Match first when the order crosses, and take a slot only for what is left. That needs care: fills cannot be taken back if no slot turns up afterwards. Or keep a few slots in reserve for this case. |
+| W-24 | medium | A whole command through a shard takes about 85 ns at the median in the sandbox. The book's own part of that is about 16 ns. The other 70 ns is the ring hop, the clock read, encoding the replies, staging them and pushing them out, and none of it has been profiled. | Most of the time on the matching path is spent around the matching, where there may be easy gains. | Profile `planck-bench --filter shard.inline` with `perf`. First suspects: two wire messages built and copied per order, and stage-then-copy for output that could go straight to the ring. |
 
 ## Journal
 
@@ -66,10 +68,10 @@ means a real operational gap. **low** means a rough edge.
 | W-60 | medium | `planckd` is configured only by flags. Symbols are numbered 1 to N with no names, and every symbol shares one price band. | A real symbol list needs a band per symbol and a stable mapping from name to id. | A small config file: id, name, band and shard per symbol. See D-10. |
 | W-61 | medium | Orders that arrive after the shards have stopped get no answer, and nothing tells connected clients that the venue is going down. | A client sees a silent close in the middle of its work. | Stop accepting first, answer or reject what is queued, then close each session. |
 | W-62 | low | `planck-mdtap` prints events and does not rebuild books. There is no top-of-book view. | It cannot show that the feed alone is enough to hold a book. Only the tests prove that. | Add a `--book` mode with a fixed-size order table. |
-| W-63 | low | `planck-client` sends one request and waits for its answer before the next. | It cannot generate load. | That is the job of `bench/`. Keep the client simple. |
-| W-64 | low | `planckd` counters reach the printout up to 1024 loop passes late, and only when asked with `--stats`. There is no log file and no way to query a running venue. | Little visibility in operation. | A stats socket or a shared-memory page, once `perf/` exists. |
+| W-63 | low | `planck-client` sends one request and waits for its answer before the next. | It cannot generate load. | That is `planck-loadgen`'s job. Keep the client simple. |
+| W-64 | low | `planckd` counters reach the printout up to 1024 loop passes late, and only when asked with `--stats`. There is no log file and no way to query a running venue. | Little visibility in operation. | A stats socket or a shared-memory page. |
 | W-65 | low | `planck-replay` checks and prints a journal. It does not rebuild books from one or compare two runs. | Looking into a journal by hand is the only offline tool. | Add a mode that replays into a shard and prints the resulting books. |
-| W-66 | low | The latency `planckd` prints covers request off the socket to report picked up for sending. It leaves out the kernel's network stack on both sides and the final `send()`. | It understates what a client sees. | `bench/` will measure from the client's side. Hardware timestamps for the rest. |
+| W-66 | low | The latency `planckd` prints covers request off the socket to report picked up for sending. It leaves out the kernel's network stack on both sides and the final `send()`. | It understates what a client sees. | `planck-loadgen` measures from the client's side, kernel included. Hardware timestamps for the rest. |
 
 ## Not tested
 
@@ -83,21 +85,39 @@ means a real operational gap. **low** means a rough edge.
 | W-45 | Packet loss, reordering and duplication from a real network. Tests drop whole datagrams by hand. |
 | W-46 | The timestamp clamp when the wall clock really steps backwards. |
 | W-47 | AArch64. The code has paths for it and none has been compiled. |
-| W-48 | The `journal/` and `perf/` modules, and the journaling changes to the shard, gateway and `planckd`, under GCC 16. They were developed with GCC 13 and Clang 18. Whether the full test suite passes on GCC 16 for `net/`, `gateway/` and `feed/` has also not been reported, only that the programs build and trade. |
+| W-48 | `bench/` and `capi/` under GCC 16. They were developed with GCC 13 and Clang 18. Everything before them has passed its 268 tests on GCC 16.0.1 under WSL2. |
 | W-49 | `planckd` with `--cpus`, `--lock-memory`, `--huge require` or `--idle spin`. The end-to-end test runs unpinned on loopback, and the development sandbox has two CPUs. |
 | W-52 | `planck-client` typed at from a terminal. Every run so far fed it a script through a pipe. |
 | W-55 | A journal after real power loss. Torn and damaged files are made by hand in the tests. Killing the process is tested, and loses nothing. |
 | W-56 | The recorder when the disk fills or fails. The code path that sets `failed()` has never run. |
 | W-57 | The journal and recorder with more than two shards, or on a slow disk. |
+| W-58 | `libplanck.so` from any language other than C, C++ and Python. From Python only through cffi in ABI mode, and that test is skipped where cffi is not installed and in sanitizer builds. |
+| W-59 | `planck-loadgen` with more than four sessions, for longer than a few seconds, or against a venue on another machine. `planck-bench` with `--cpu` and `--cpu2` on isolated cores. |
+| W-67 | Build options in combination. Two were tried besides the default: apps and C library off, and tests off. |
 | W-53 | The three programs talking over multicast inside the automated test. It was done once by hand. The end-to-end test uses plain loopback addresses so it passes on hosts without multicast. |
 
 ## Measurement
 
 | Id | Severity | Weakness | Fix |
 |----|----------|----------|-----|
-| W-50 | high | There are no trustworthy latency numbers. `planckd --stats` now prints percentiles, but nothing has been measured on pinned, isolated cores, and the journal's cost to the shard is unmeasured. The project's one-line claim is nanosecond tail latency. | `bench/`, on real hardware. |
-| W-54 | low | The end-to-end test picks its four ports from its process id, in the range 12000 to 28000. Another program already on one of them makes the test fail. | Let the programs bind port 0 and report what they got, then have the script read it. |
-| W-51 | medium | The seeded-bug check (plant a bug, confirm a test fails) is a throwaway script outside the repo. An earlier version of it gave false passes. | Put a proper version in `tools/` and run it before each milestone. |
+| W-50 | high | There are no trustworthy latency numbers. The tools now exist (`planck-bench`, `planck-loadgen`, see `benchmarks.md`), but every figure so far comes from a shared virtual machine with two CPUs. Nothing has been measured on pinned, isolated cores. The project's one-line claim is nanosecond tail latency. | Run both on real hardware with `--cpu`, isolated cores and a Release build, and write the results into `benchmarks.md`. Not under WSL2 until W-30 is understood. |
+| W-80 | medium | Nothing measures how long a command takes to reach the disk, how fast the recorder can write, or what the gateway and the publisher cost on their own. `planck-bench` shows only what journaling costs the matching thread, which is nothing visible. | D-12 needs the time to durable, and that is still unmeasured. Add a recorder benchmark, and report sync latency from `planckd`. |
+| W-81 | low | `planck-loadgen` times new orders only. Cancels are sent and counted but not timed. It is one thread, so above some rate the generator is the bottleneck. The due-time row shows that lateness, but nothing says whose fault it was. | Time cancels too. Report how late orders were sent, separately from how long the venue took. |
+| W-82 | low | Benchmark results are printed and forgotten. Nothing stores them or compares one run with the last. | A slowdown would be noticed only by someone reading the numbers. A script in `tools/` that keeps the CSV output and flags changes. |
+| W-83 | low | The stopwatch takes its own smallest cost off every sample, about 20 ns in the sandbox. For operations of a few nanoseconds, such as one ring push and pop, the result is the difference of two similar numbers and is not precise. Histogram buckets add up to 3 percent. | Treat rows under about 10 ns as "too small to time singly". Time those in batches instead. |
+| W-54 | low | The end-to-end tests pick their ports from their process id: `apps_smoke` in 12000 to 28000, `bench_smoke` in 28000 to 40000. Another program already on one of them makes the test fail. | Let the programs bind port 0 and report what they got, then have the scripts read it. |
+| W-51 | medium | The seeded-bug check (plant a bug, confirm a test fails) is a throwaway script outside the repo. An earlier version of it gave false passes. The current one leaves the last planted bug's binaries behind, which twice made a clean tree look broken until it was rebuilt. | Put a proper version in `tools/` and run it before each milestone. |
+
+## C interface
+
+| Id | Severity | Weakness | Why it matters | Fix |
+|----|----------|----------|----------------|-----|
+| W-90 | medium | `libplanck.so` is the matching engine and nothing else: one shard, driven on the caller's thread. No journal, no replay, no gateway, no feed, no second shard. | Enough to embed the books in a simulator or a backtest. Not enough to run or talk to a venue from another language. | Depends on D-15. |
+| W-91 | medium | The engine's output queues are sized so that one order sweeping a full book cannot overflow them, because on a single thread nothing can drain them mid-match. That is up to about 400 bytes for every order of capacity: about 25 MB at the default 65,536 and about 870 MB at the 4,000,000 limit. | Most of that memory exists for a case that almost never happens. | Let a shard that is driven inline hand each message straight to the caller instead of queueing it. Depends on D-16. |
+| W-92 | low | Every timestamp comes from the engine's own clock. A caller cannot supply the time. | Two runs of the same orders give the same books but different timestamps, so a backtest is not reproducible byte for byte. The shard can already take a forced time, for replay. It is not exposed. | A config flag for caller-supplied time, and a timestamp argument on submit and cancel. |
+| W-93 | low | `planck_engine_create` blocks for about 50 ms while the engine calibrates its clock, and every engine does so separately. | Creating many engines, as a parameter sweep would, is slow. | Calibrate once per process and share the result. |
+| W-94 | low | No install rules, no pkg-config file, no static variant of the library, and no language binding beyond the header. Linux only: the build relies on a linker version script. | Using the library outside this build tree means copying two files by hand. | Install rules and a `planck.pc`, when `scripts/` and packaging are done. |
+| W-95 | low | The promise that no call aborts on bad input rests on the checks in `capi/src/planck.cpp` being complete. Past them, a broken contract still aborts the host process in a checked build and is undefined behaviour in a release build. | A missed check at the boundary would take down the program that loaded the library. | Fuzz the C interface. Every struct is small and fixed, so this is cheap. |
 
 ## Fixed
 
@@ -112,3 +132,5 @@ means a real operational gap. **low** means a rough edge.
 | F-07 | 2026-11 | Nothing was persisted. A restart lost every resting order. (Was W-20.) | `journal/`: every command is recorded, and `planckd --journal` rebuilds the books and the market data stream from it at startup. |
 | F-08 | 2026-11 | After a restart a new session could have been given the id of an old one and inherited its resting orders. | The gateway starts its session ids above the highest in the journal. |
 | F-09 | 2026-11 | GCC 16 had not built `net/`, `gateway/`, `feed/` or `apps/`. (Was part of W-48.) | Built and run by hand on GCC 16.0.1 under WSL2: two clients traded through `planckd` and the counters matched. |
+| F-10 | 2026-11 | The test suite had not been run on GCC 16 past `engine/`. (Was part of W-48.) | All 268 tests of the modules up to and including `journal/` and `perf/` pass on GCC 16.0.1 under WSL2. |
+| F-11 | 2026-11 | The journal's cost to the matching thread was unmeasured. (Was part of W-50.) | `planck-bench` times a shard with and without journaling. The difference is within the noise of the sandbox: about 85 ns either way at the median. |
