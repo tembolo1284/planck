@@ -1,8 +1,8 @@
 # Operations
 
 Running `planckd` and the tools around it. This is honest about how little
-operational machinery exists yet: no config file, no log file, no
-monitoring endpoint (W-60, W-64).
+operational machinery exists yet: no config file for symbols, no log file,
+no monitoring endpoint (W-60, W-64).
 
 ## planckd
 
@@ -20,6 +20,7 @@ planckd [options]
 | `--band-low TICKS` | 0 | Lowest price accepted, every symbol |
 | `--band-ticks N` | 65536 | Prices per symbol. A power of two, 64 to 262144. |
 | `--orders N` | 1048576 | Resting orders per shard |
+| `--clients FILE` | off | Who may log in. Without it anyone may, as any client id. See "Clients" below. |
 | `--journal DIRECTORY` | off | Record every command, and rebuild from it at startup |
 | `--journal-sync MS` | 10 | Longest a command may wait to reach the disk. 0 syncs after every write. |
 | `--cpus LIST` | none | Pin threads, for example `2-5` or `2,4,6,8` |
@@ -39,6 +40,7 @@ planckd 2 shards, 8 symbols (ids 1 to 8), prices 0 to 65535
 feed stream 0 -> 127.0.0.1:30001
 feed stream 1 -> 127.0.0.1:30002
 order entry on 0.0.0.0:9000
+clients: 12 listed in /etc/planck/clients
 retransmit requests on 0.0.0.0:30000
 journal in /var/planck, synced within 10 ms
 shard 0 replayed 18234 commands
@@ -48,6 +50,46 @@ ready
 
 Scripts should wait for `ready` before connecting. On the way down it prints
 `stopping` and then the counters one last time.
+
+### Clients
+
+`--clients FILE` names a text file with one client per line:
+
+```
+# desk A
+1 1001
+2 0x7d2          # tokens may be hexadecimal
+17 18364758544493064720
+```
+
+The first number is the client id, from 1 to 65,535, listed once. The
+second is that client's token, any 64-bit number. Anything after a `#` is a
+comment. A file with a mistake in it stops the venue from starting, and the
+message names the line. At most 4,096 clients.
+
+- A client logs in with its id and token: `planck-client --client-id 17
+  --token 18364758544493064720`. The token is decimal on the command line.
+- The client id is the session id. It owns the client's orders, on every
+  connection and across restarts, so do not hand a retired client's id to
+  someone new while its orders may still be in the book or the journal.
+- The file is read once. Changing it means a restart (W-09).
+- Keep it readable by the venue's user only: `chmod 600`. Tokens are stored
+  as written.
+- Make tokens random. `od -An -N8 -tu8 /dev/urandom` prints one.
+
+**Without `--clients`** the venue prints `clients: anyone may log in` and
+means it. Any client id from 1 to 65,535 is accepted and the token is
+ignored. Anyone who can reach the port can log in as a client that is not
+connected, cancel its orders and receive its fills (W-05). That is right
+for tests, benchmarks and the demo, and for nothing else.
+
+**The network.** The token is sent in the clear and is the same every time
+(W-08). It stops one client posing as another. It does not stop anyone who
+can read or alter the traffic. So order entry must run over a link that
+strangers are not on: a private network, or a tunnel. For clients on home
+or office internet, put the venue and each client on a WireGuard network
+and have `planckd --listen` bind the venue's tunnel address, not `0.0.0.0`.
+Nothing in planck sets this up, and it has not been tried here (W-86).
 
 ### Threads and CPUs
 
@@ -83,7 +125,7 @@ None of this has been exercised in development (W-43, W-49).
 ```
 stats engine  commands accepted rejected trades cancels resting stalls
 stats gateway sessions connections logins messages rejected busy reports
-              dropped protocol_errors slow_consumers
+              dropped protocol_errors slow_consumers bad_credentials
 stats feed    messages datagrams heartbeats send_failures retransmit_requests
               retransmitted refused
 stats latency reports p50_ns p99_ns p999_ns max_ns
@@ -96,7 +138,8 @@ What to watch:
 |---------|-----------------------------------|
 | `engine stalls` | A consumer of the shard's output is too slow. The shard waited. |
 | `gateway busy` | Orders were rejected because a command ring was full. The shard is the bottleneck. |
-| `gateway dropped` | Reports for sessions that are gone. Expected after a disconnect (W-01). |
+| `gateway dropped` | Reports for clients that had no connection at the time. Expected after a disconnect (W-01). |
+| `gateway bad_credentials` | Logins refused: not listed, or the wrong token. A steady climb is someone guessing. |
 | `gateway slow_consumers` | Clients disconnected for not reading their reports (D-03) |
 | `gateway protocol_errors` | Clients sent bytes that are not the protocol |
 | `feed send_failures` | The kernel refused datagrams. Subscribers will have gaps. |
@@ -134,6 +177,7 @@ there are no snapshots (W-72).
 | It reports | Cause | What to do |
 |--------------|-------|------------|
 | `InvalidArgument` while rebuilding a shard | `--shards`, `--symbols`, `--band-*` or `--orders` differ from the run that wrote it (W-74) | Use the old flags, or move the journal away and start empty |
+| `Unsupported` while rebuilding a shard | The journal is in an older format. Journals written before sessions became client ids are format 1, and this venue reads format 2 (S-26). | Move the journal away and start empty |
 | `Protocol` while rebuilding a shard | A bad record with good ones after it (S-13) | Inspect with `planck-replay`. Decide by hand. There is no repair tool. |
 
 **If the journal fails while running** (disk full or failing), `planckd`
@@ -144,9 +188,12 @@ venue.
 **Starting a new day:** stop the venue, move the journal directory away,
 start again. There is no rotation.
 
-**Sessions:** after a restart, clients must log in again and get new session
-ids. Orders from before the restart still rest in the book, and nobody can
-cancel them (D-14).
+**Sessions:** after a restart, clients must log in again. Each is the same
+session as before, because a session id is a client id. Orders from before
+the restart still rest in the book and still belong to their clients, who
+can cancel them. Fills that happened while a client was away are not
+reported to it (W-01). Once cancel on disconnect is built, a restart will
+cancel every resting order (D-14).
 
 ## The other programs
 
@@ -156,8 +203,8 @@ An interactive order entry client. Reads commands from the terminal or a
 pipe.
 
 ```
-planck-client [--connect ADDRESS:PORT] [--client-id N] [--linger MS]
-               defaults: 127.0.0.1:9000, 1, 200
+planck-client [--connect ADDRESS:PORT] [--client-id N] [--token N] [--linger MS]
+               defaults: 127.0.0.1:9000, 1, 0, 200
 ```
 
 ```
@@ -224,7 +271,7 @@ See [benchmarks.md](benchmarks.md).
 ## Known operational gaps
 
 Before putting this in front of anyone, read the Gateway, Feed, Journal and
-Programs sections of [weaknesses.md](weaknesses.md). In short: no
-authentication, no cancel on disconnect, no heartbeats or idle timeout, no
-feed snapshots, an unprotected retransmit port, asynchronous durability, no
-clean shutdown for clients, and no monitoring beyond stdout.
+Programs sections of [weaknesses.md](weaknesses.md). In short: a login
+token sent in the clear, no cancel on disconnect, no heartbeats or idle
+timeout, no feed snapshots, an unprotected retransmit port, asynchronous
+durability, no clean shutdown for clients, and no monitoring beyond stdout.

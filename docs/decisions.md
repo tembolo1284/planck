@@ -1,25 +1,36 @@
 # Decisions
 
 Choices that shape planck and could reasonably have gone another way. The
-open ones are to be settled once every directory has had a first pass. Until
-then the code does what "Today" says.
+open ones are being settled one at a time, in the order under "Agreed plan".
+Until one is settled the code does what "Today" says.
 
 Things that are simply broken or missing live in `weaknesses.md`.
+
+## Agreed plan
+
+Decided on 2026-11-26. Each step ends with its tests, its seeded bugs and
+these documents brought up to date.
+
+| Step | What | Covers | State |
+|-----:|------|--------|-------|
+| 1 | Sessions that outlive connections, and a list of who may log in | D-02, W-02, W-05 | done: S-23, S-24 |
+| 2 | Cancel on disconnect, and at restart | D-01, D-14, W-01 | next |
+| 3 | Heartbeats, report sequence numbers, report recovery, idempotent orders | W-03, W-04 | |
+| 4 | A commit boundary: nothing is told to anyone before it is durable. Measure the cost first. | D-12, D-13, W-70, W-71, W-80 | |
+| 5 | Feed snapshots and a separate, rate-limited recovery service | D-05, W-10, W-11, W-13 | |
+| 6 | A failed market data consumer must not stop matching | W-21 | |
+| any time | Measure on real hardware | W-50 | |
+
+Replicating commands to a standby engine comes after step 4, as a project
+of its own.
 
 ## Open
 
 ### D-01 What happens to a client's orders when it disconnects
-- **Today:** they stay in the book until they trade. Session ids are never reused, so nobody else can cancel them or receive their fills.
-- **Alternative A:** cancel on disconnect. This is what most venues do. It needs a per-session list of live orders, kept by the shard.
-- **Alternative B:** keep the orders and let the same client id reclaim them after logging in again. This needs authentication (D-02) and report replay (W-04).
-- **Leaning:** A, as a per-session flag chosen at login.
-- **Touches:** W-01, W-02.
-
-### D-02 Authentication
-- **Today:** none. The login token is accepted and ignored.
-- **Alternatives:** a static table of client id and token loaded at start, or leave it to the network (private links, an authenticating proxy in front).
-- **Leaning:** static table. It is small, and it makes D-01 B possible.
-- **Touches:** W-05.
+- **Today:** they stay in the book and go on trading. They still belong to the client, which gets them back by logging in again (S-24). Fills that happen while it is away are not reported to it.
+- **Decided, not yet built:** cancel on disconnect first. The gateway tells every shard that the session has lost its connection, as a journaled command, and each shard cancels that session's resting orders. It needs a list of live orders per session, kept by the shard.
+- **Later:** let a client choose at login to keep its orders working while it is away, once reports can be recovered after a reconnect (W-04).
+- **Touches:** W-01, D-14.
 
 ### D-03 Slow order entry clients
 - **Today:** a client with more than 64 KiB of unread reports is disconnected.
@@ -79,10 +90,9 @@ Things that are simply broken or missing live in `weaknesses.md`.
 - **Touches:** W-71.
 
 ### D-14 How replay treats sessions
-- **Today:** replay rebuilds books and market data and tells no session anything. Orders from before the restart rest with no owner able to cancel them, exactly like orders left by a disconnect.
-- **Alternative:** cancel every resting order at restart, which many venues do, or let clients reclaim their orders after logging in again.
-- **Leaning:** settle together with D-01. They are the same question.
-- **Touches:** W-01.
+- **Today:** replay rebuilds books and market data and tells no session anything. Orders from before the restart rest in the book and still belong to their clients, who can cancel them after logging in again (S-24).
+- **Decided, not yet built:** a restart is a disconnect of everyone. Once D-01 is built, the venue cancels every resting order after replay, by the same journaled command.
+- **Touches:** W-01, D-01.
 
 ### D-15 How much of planck the C library covers
 - **Today:** the matching engine only. One shard on the caller's thread: submit, cancel, read reports and market events, query the book.
@@ -132,3 +142,7 @@ Things that are simply broken or missing live in `weaknesses.md`.
 | S-20 | One build directory for each pairing of compiler and build kind, `build/<compiler>-<kind>`, defined once in `CMakePresets.json`. `build.sh` is a front end to the presets and holds no settings of its own. | Switching compiler or build kind never forces a rebuild, and the script, an editor and a bare `cmake --preset` all land in the same place. |
 | S-21 | Five build kinds: release, debug, checked, asan and tsan. "checked" is optimised with contracts on, and is the one tests are meant to run in. | A debug build is too slow for the randomized tests to do much, and a release build assumes its contracts instead of checking them. |
 | S-22 | Tools are Python with no packages beyond the standard library, and scripts are bash. | Nothing to install, and they run on any machine that can build planck. |
+| S-23 | Who may log in is a file of client ids and tokens, read at startup (`planckd --clients`). Without the file anyone may log in as any client id, which is for tests and a closed lab only. The token travels in the clear, so the link itself must be private: a private network, or a tunnel such as WireGuard. No TLS in the gateway. (Was D-02.) | A table is small and has no moving parts. Encrypting in the gateway would put a cipher on the order path. A tunnel keeps strangers out below the venue, where it costs the matching path nothing. |
+| S-24 | A session is not a connection. A session is a client's standing with the venue: its id is the client id, from 1 to 65,535, the same on every connection and across restarts, and it owns the orders. A connection is one TCP link. At most one connection speaks for a session at a time. | Orders must belong to something that survives a dropped line and a restart, or nobody can ever be given their orders or their reports back. Using the client id itself, and not a number looked up from it, means the journal says who owns what with no table to keep in step. It also removes the limit of 65,535 connections in a run. |
+| S-25 | A refused login is told why and then disconnected. A client that is not listed and a client with the wrong token get the same answer. | One try per connection, and a stranger cannot learn which client ids exist. |
+| S-26 | Journal format 2. A journal written before S-24 is refused at startup. | Its session numbers named connections, not clients, so it cannot say who owns the orders it would rebuild. |

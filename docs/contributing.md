@@ -168,12 +168,14 @@ where it is weakest, and what is next. Ids point into
 - **Read:** `gateway.hpp`'s header comment, then `Gateway::poll`.
 - **Promises:** validates everything, never blocks, never lets one client
   stall another.
-- **Weakest:** this is where most product decisions are open. D-01 cancel
-  on disconnect, D-02 authentication, W-03 heartbeats and idle timeout,
-  W-04 report replay, W-61 clean shutdown. D-01 is the one to settle first,
-  since D-14 and W-01 hang on it.
-- **Never tested:** slow-consumer disconnect (W-40), running out of session
-  ids (W-41).
+- **Know first:** a session is not a connection (S-24). Read the comment
+  above `class Gateway` before anything else.
+- **Weakest:** this is where most of the agreed plan lands. D-01 cancel on
+  disconnect is next, then W-03 heartbeats and idle timeout and W-04 report
+  recovery. Also W-08 (the token is sent in the clear) and W-61 clean
+  shutdown.
+- **Never tested:** slow-consumer disconnect (W-40), anything over a real
+  network (W-86).
 
 ### feed
 
@@ -225,11 +227,17 @@ where it is weakest, and what is next. Ids point into
 
 ## What to do next, in order
 
-1. Build and test everything on GCC 16 (W-48). Nothing after `journal/`
-   has been confirmed there.
-2. Profile the 70 ns around the book (W-24).
-3. Measure on real hardware (W-50), and put the numbers in
-   `benchmarks.md`.
-4. Settle D-01 and D-14 together, then D-02.
-5. Snapshots, once, for both feed and journal (D-05, W-10, W-72).
-6. Decide D-12 and D-13 once the time to durable has been measured (W-80).
+The order was agreed on 2026-11-26 and is kept as the "Agreed plan" at the
+top of [decisions.md](decisions.md). Step 1 is done. In short:
+
+1. Cancel on disconnect and at restart (D-01, D-14).
+2. Heartbeats, report sequence numbers and recovery, idempotent orders
+   (W-03, W-04).
+3. A commit boundary for reports and market data, after measuring the time
+   to durable (D-12, D-13, W-80).
+4. Snapshots and a separate recovery service for the feed (D-05, W-10,
+   W-11).
+5. A failed market data consumer must not stop matching (W-21).
+
+Alongside, whenever there is hardware for it: measure on real machines
+(W-50), and profile the 70 ns around the book (W-24).

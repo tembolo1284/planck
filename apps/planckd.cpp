@@ -57,6 +57,8 @@ constexpr char kUsage[] =
     "  --band-low TICKS           lowest price accepted       (0)\n"
     "  --band-ticks N             prices per symbol, a power of two (65536)\n"
     "  --orders N                 resting orders per shard    (1048576)\n"
+    "  --clients FILE             who may log in: one 'CLIENT_ID TOKEN' per line.\n"
+    "                             Without this anyone may, as any client id.\n"
     "  --journal DIRECTORY        record every command here, and rebuild the books from\n"
     "                             it at startup. Without this a restart starts empty.\n"
     "  --journal-sync MS          longest a command may wait to reach the disk. 0 forces\n"
@@ -89,11 +91,14 @@ struct Options {
     // Empty means no journal.
     std::string_view journal{};
     std::uint32_t journal_sync_ms = 10;
+    // Empty means anyone may log in.
+    std::string_view clients{};
     // One CPU per thread when pinning: shards, then gateway, publisher and
     // journal recorder.
     std::array<std::size_t, core::kMaxShards + 3> cpus{};
 
     [[nodiscard]] bool journaling() const noexcept { return !journal.empty(); }
+    [[nodiscard]] bool restricted() const noexcept { return !clients.empty(); }
 };
 
 // A counter one thread writes and another reads. The components keep plain
@@ -146,7 +151,7 @@ struct GatewayRuntime {
     // Valid once state is Running.
     net::Endpoint endpoint{};
     Counter sessions, connections, logins, messages_in, rejected, busy, reports_out,
-        reports_dropped, protocol_errors, slow_consumers;
+        reports_dropped, protocol_errors, slow_consumers, bad_credentials;
 
     // Time from a request coming off the socket to its report being picked
     // up to send, in counter ticks. Only the gateway thread touches it.
@@ -184,6 +189,7 @@ struct GatewayRuntime {
         reports_dropped.set(s.reports_dropped);
         protocol_errors.set(s.protocol_errors);
         slow_consumers.set(s.slow_consumers);
+        bad_credentials.set(s.bad_credentials);
     }
 };
 
@@ -239,6 +245,8 @@ struct Venue {
     std::array<engine::SymbolConfig, core::kMaxSymbols> symbols{};
     std::array<gateway::Route, core::kMaxSymbols> routes{};
     std::array<net::Endpoint, core::kMaxShards> destinations{};
+    // Loaded by main before any thread starts, and read-only from then on.
+    gateway::Credentials credentials;
 
     // Matching stops first. The gateway and the publisher keep running until
     // the shards have gone, so nothing a shard produced is left behind.
@@ -335,11 +343,11 @@ void shard_main(Venue& venue, const Options& options, std::size_t index,
           [&runtime]() noexcept { return runtime.shard.poll(); });
 }
 
-void gateway_main(Venue& venue, const Options& options, std::uint32_t first_session_id) noexcept {
+void gateway_main(Venue& venue, const Options& options) noexcept {
     GatewayRuntime& runtime = venue.gateway;
     gateway::GatewayConfig config;
     config.listen = options.listen;
-    config.first_session_id = first_session_id;
+    config.credentials = options.restricted() ? &venue.credentials : nullptr;
     config.latency = &runtime.latency;
     config.shards = std::span<engine::Shard* const>{venue.shard_pointers.data(), options.shards};
     config.routes = std::span<const gateway::Route>{venue.routes.data(), options.symbols};
@@ -447,7 +455,7 @@ void print_stats(const Venue& venue, std::uint32_t shards) noexcept {
                 static_cast<unsigned long long>(stalls));
     std::printf("stats gateway sessions=%llu connections=%llu logins=%llu messages=%llu "
                 "rejected=%llu busy=%llu reports=%llu dropped=%llu protocol_errors=%llu "
-                "slow_consumers=%llu\n",
+                "slow_consumers=%llu bad_credentials=%llu\n",
                 static_cast<unsigned long long>(g.sessions.get()),
                 static_cast<unsigned long long>(g.connections.get()),
                 static_cast<unsigned long long>(g.logins.get()),
@@ -457,7 +465,8 @@ void print_stats(const Venue& venue, std::uint32_t shards) noexcept {
                 static_cast<unsigned long long>(g.reports_out.get()),
                 static_cast<unsigned long long>(g.reports_dropped.get()),
                 static_cast<unsigned long long>(g.protocol_errors.get()),
-                static_cast<unsigned long long>(g.slow_consumers.get()));
+                static_cast<unsigned long long>(g.slow_consumers.get()),
+                static_cast<unsigned long long>(g.bad_credentials.get()));
     std::printf("stats feed messages=%llu datagrams=%llu heartbeats=%llu send_failures=%llu "
                 "retransmit_requests=%llu retransmitted=%llu refused=%llu\n",
                 static_cast<unsigned long long>(p.messages.get()),
@@ -491,7 +500,7 @@ void print_stats(const Venue& venue, std::uint32_t shards) noexcept {
     std::string_view idle;
     std::string_view cpus;
     if (!args.text("--huge", huge) || !args.text("--idle", idle) || !args.text("--cpus", cpus) ||
-        !args.text("--journal", options.journal) ||
+        !args.text("--journal", options.journal) || !args.text("--clients", options.clients) ||
         !args.number<std::uint32_t>("--journal-sync", options.journal_sync_ms, 0, 60'000)) {
         return false;
     }
@@ -661,13 +670,8 @@ void shut_down(Venue& venue, std::uint32_t shards) noexcept {
 
     // Each shard now rebuilds itself from its journal, if there is one.
     venue.replay_go.store(true);
-    std::uint32_t first_session_id = 1;
     for (std::uint32_t i = 0; i < options.shards; ++i) {
         up = started(venue.shards[i].recovery, "rebuilding a shard from its journal") && up;
-        const journal::ReplayResult& replayed = venue.shards[i].replayed;
-        if (replayed.max_session >= first_session_id) {
-            first_session_id = std::uint32_t{replayed.max_session} + 1;
-        }
     }
     if (!up) {
         std::fprintf(stderr,
@@ -686,11 +690,10 @@ void shut_down(Venue& venue, std::uint32_t shards) noexcept {
         }
     }
 
-    // Clients last, once there is a venue for them to talk to. New sessions
-    // get ids above any the journal mentions, so nobody inherits an old
-    // session's resting orders.
-    venue.gateway.thread = std::thread(
-        [&venue, &options, first_session_id] { gateway_main(venue, options, first_session_id); });
+    // Clients last, once there is a venue for them to talk to. A session id
+    // is a client id, so the orders the journal rebuilt belong to the same
+    // clients as before the restart.
+    venue.gateway.thread = std::thread([&venue, &options] { gateway_main(venue, options); });
     return started(venue.gateway.life, "the order entry gateway");
 }
 
@@ -710,6 +713,12 @@ void print_banner(const Venue& venue, const Options& options) noexcept {
                     apps::format_endpoint(venue.destinations[i]).c_str());
     }
     std::printf("order entry on %s\n", apps::format_endpoint(venue.gateway.endpoint).c_str());
+    if (options.restricted()) {
+        std::printf("clients: %zu listed in %.*s\n", venue.credentials.size(),
+                    static_cast<int>(options.clients.size()), options.clients.data());
+    } else {
+        std::printf("clients: anyone may log in, as any client id (no --clients file)\n");
+    }
     std::printf("retransmit requests on %s\n",
                 apps::format_endpoint(venue.publisher.endpoint).c_str());
     if (options.journaling()) {
@@ -724,6 +733,26 @@ void print_banner(const Venue& venue, const Options& options) noexcept {
         }
     }
     std::printf("ready\n");
+}
+
+[[nodiscard]] bool load_clients(Venue& venue, const Options& options) noexcept {
+    std::uint32_t bad_line = 0;
+    // The string came from argv, so it ends in a terminator.
+    const Status status = venue.credentials.load(options.clients.data(), bad_line);
+    if (ok(status)) {
+        return true;
+    }
+    const std::string_view reason = core::to_string(status);
+    if (bad_line != 0) {
+        std::fprintf(stderr, "planckd: %s line %u: %.*s. Each line is 'CLIENT_ID TOKEN', "
+                             "with the id from 1 to 65535 and listed once.\n",
+                     options.clients.data(), bad_line, static_cast<int>(reason.size()),
+                     reason.data());
+    } else {
+        std::fprintf(stderr, "planckd: cannot read the clients file %s: %.*s\n",
+                     options.clients.data(), static_cast<int>(reason.size()), reason.data());
+    }
+    return false;
 }
 
 int run(const Options& options) noexcept {
@@ -750,6 +779,9 @@ int run(const Options& options) noexcept {
     const std::unique_ptr<Venue> venue{new Venue{}};
     std::array<std::size_t, core::kMaxShards> counts{};
     assign_symbols(*venue, options, counts);
+    if (options.restricted() && !load_clients(*venue, options)) {
+        return 1;
+    }
 
     if (!start(*venue, options, counts)) {
         shut_down(*venue, options.shards);

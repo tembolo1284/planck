@@ -7,7 +7,8 @@
 # what each client was told, what appeared on the market data feed, and that
 # a late subscriber can replay the feed. Then kills the venue outright,
 # starts it again from its journal, and checks that the books, the feed and
-# the session numbering all carried over.
+# the ownership of resting orders all carried over. The venue runs with a
+# clients file throughout, so who may log in is checked as well.
 set -u
 
 bin="${1:?usage: apps_smoke.sh <bin directory>}"
@@ -56,10 +57,14 @@ quiet_feed_port=$((base + 1))   # stream 0: shard 0, which trades symbol 2
 feed_port=$((base + 2))         # stream 1: shard 1, which trades symbol 1
 retransmit_port=$((base + 3))
 
+# Only these three may log in, each with its own token.
+printf '# client token\n1 1001\n2 0x7d2   # 2002\n3 3003\n' > "$work/clients"
+
 # Two shards, so that routing by symbol and one feed stream per shard are
 # both exercised. Symbol S trades on shard S mod 2.
 start_venue() {
-    "$bin/planckd" --listen "127.0.0.1:$order_port" --feed "127.0.0.1:$quiet_feed_port" \
+    "$bin/planckd" --clients "$work/clients" --listen "127.0.0.1:$order_port" \
+        --feed "127.0.0.1:$quiet_feed_port" \
         --retransmit "127.0.0.1:$retransmit_port" --shards 2 --symbols 4 --orders 4096 \
         --huge off --journal "$work/journal" > "$work/$1" 2>&1 &
     venue_pid=$!
@@ -67,6 +72,7 @@ start_venue() {
 }
 start_venue venue.log
 expect venue.log '^shard 1 replayed 0 commands$' "a first start found something to replay"
+expect venue.log '^clients: 3 listed in ' "the venue did not read its clients file"
 
 # A live subscriber, there from the first message.
 "$bin/planck-mdtap" --stream 1 --listen "127.0.0.1:$feed_port" --count 4 \
@@ -76,7 +82,7 @@ wait_for tap.log '^listening for stream 1 '
 
 # The maker rests an order and stays connected to hear it trade.
 printf 'sell 1 10 1000\nwait 300000\n' |
-    "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 1 \
+    "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 1 --token 1001 \
     > "$work/maker.log" 2>&1 &
 maker_pid=$!
 wait_for maker.log '^accepted client_order_id=1 '
@@ -84,7 +90,7 @@ wait_for maker.log '^accepted client_order_id=1 '
 # The taker trades with it, rests an order of its own and cancels that, is
 # refused twice, and leaves an order resting in the other shard's symbol.
 printf 'buy 1 4 1000\nbuy 1 3 990\ncancel last\nbuy 9 1 1000\nbuy 1 1 999999\nsell 2 5 500\n' |
-    "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 2 \
+    "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 2 --token 2002 \
     > "$work/taker.log" 2>&1 || fail "the taker exited with an error"
 
 expect taker.log '^logged in client_id=2 ' "the taker never logged in"
@@ -120,9 +126,19 @@ expect late.log '^summary messages=4 .* lost=0$' "the replay lost messages"
 
 # A second login under an id that is in use is refused.
 printf 'ping\n' |
-    "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 1 \
+    "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 1 --token 1001 \
     > "$work/twin.log" 2>&1 && fail "a duplicate client id was allowed to log in"
 expect twin.log '^login rejected reason=AlreadyLoggedIn$' "the duplicate login got the wrong answer"
+
+# Nor does anyone get in with the wrong token, or with an id that is not listed.
+printf 'buy 1 1 1000\n' |
+    "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 3 --token 1001 \
+    > "$work/thief.log" 2>&1 && fail "a client logged in with another client's token"
+expect thief.log '^login rejected reason=BadCredentials$' "a wrong token got the wrong answer"
+printf 'buy 1 1 1000\n' |
+    "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 4 \
+    > "$work/stranger.log" 2>&1 && fail "a client that is not listed logged in"
+expect stranger.log '^login rejected reason=BadCredentials$' "an unlisted client got the wrong answer"
 
 # ---- The venue dies without warning ----
 
@@ -158,19 +174,29 @@ start_venue venue2.log
 expect venue2.log '^shard 1 replayed 5 commands$' "shard 1 was not rebuilt from its journal"
 expect venue2.log '^shard 0 replayed 1 commands$' "shard 0 was not rebuilt from its journal"
 
-# The maker's order still has 6 left in the book. A new client cannot cancel
-# it, because it belongs to a session that is gone, but can trade with it.
+# The maker's order still has 6 left in the book, and it is still the
+# maker's: a session is a client id, on any connection and across a restart.
+# So the maker, back again, hears it trade. Another client cannot cancel it,
+# but can trade with it.
+printf 'wait 300000\n' |
+    "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 1 --token 1001 \
+    > "$work/maker2.log" 2>&1 &
+maker_pid=$!
+wait_for maker2.log '^logged in client_id=1 session=1$'
 maker_order="$(sed -n 's/^accepted client_order_id=1 order_id=\([0-9]*\) .*/\1/p' "$work/maker.log")"
 [ -n "$maker_order" ] || fail "could not find the maker's order id"
 printf 'cancel %s\nbuy 1 6 1000\n' "$maker_order" |
-    "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 3 \
+    "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 3 --token 3003 \
     > "$work/after.log" 2>&1 || fail "the client exited with an error after the restart"
-expect after.log '^logged in client_id=3 session=3$' \
-    "session ids must carry on above the ones in the journal"
+expect after.log '^logged in client_id=3 session=3$' "a session id must be the client id"
 expect after.log '^executed .* qty=6 price=1000 leaves=0 taker ' \
     "the order resting before the crash did not trade after it"
 expect after.log "^cancel rejected order_id=$maker_order reason=UnknownOrder\$" \
-    "a new session cancelled an order left by an old one"
+    "one client cancelled another's order"
+wait_for maker2.log '^executed .* qty=6 price=1000 leaves=0 maker '
+kill "$maker_pid" 2>/dev/null || true
+wait "$maker_pid" 2>/dev/null || true
+maker_pid=""
 
 # A subscriber replaying from the start sees the first life's messages
 # exactly as they were, followed by the new trade.

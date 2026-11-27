@@ -163,10 +163,13 @@ TEST(JournalFormat, HeaderIsChecked) {
     bad = good;
     bad.fingerprint ^= 1;
     EXPECT_EQ(check_header(bad), Status::Protocol) << "checksum must cover the fingerprint";
-    bad = make_header(kShard, kFingerprint, 123);
-    bad.version = 2;
-    bad.checksum = crc32c({reinterpret_cast<const std::byte*>(&bad), sizeof(bad) - 4});
-    EXPECT_EQ(check_header(bad), Status::Unsupported);
+    // Older and newer formats alike. Version 1 gave sessions another meaning.
+    for (const std::uint32_t other : {std::uint32_t{1}, kVersion + 1}) {
+        bad = make_header(kShard, kFingerprint, 123);
+        bad.version = other;
+        bad.checksum = crc32c({reinterpret_cast<const std::byte*>(&bad), sizeof(bad) - 4});
+        EXPECT_EQ(check_header(bad), Status::Unsupported) << "version " << other;
+    }
 }
 
 TEST(JournalFormat, FingerprintFollowsEverythingThatAffectsMatching) {

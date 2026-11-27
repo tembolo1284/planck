@@ -51,10 +51,11 @@ public:
         send_bytes({reinterpret_cast<const std::byte*>(&message), sizeof(T)});
     }
 
-    // Log in and return the session id the gateway assigned.
-    std::uint16_t login(std::uint32_t client_id) {
+    // Log in and return the session id the gateway answered with.
+    std::uint16_t login(std::uint32_t client_id, std::uint64_t token = 0) {
         wire::LoginRequest request{};
         request.client_id = client_id;
+        request.token = token;
         send(request);
         return expect<wire::LoginAccepted>().session_id;
     }

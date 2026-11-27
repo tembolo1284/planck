@@ -22,7 +22,7 @@ on real hardware yet, and several product decisions are still open. Read
 | Compilers | GCC 13 or later, Clang 18 or later |
 | Platform | Linux on x86-64. AArch64 paths exist and are untested. |
 | Build | CMake 3.25 or later with Ninja, driven by `./build.sh` |
-| Tests | 300, in ten build configurations |
+| Tests | 308, in ten build configurations |
 | Size | about 7,700 lines of library, 7,900 of tests |
 
 ## Quick start
@@ -105,7 +105,9 @@ own four rings.
 
 If you are taking over part of the project, start with
 [architecture.md](docs/architecture.md), then the "Taking over a module"
-section of [contributing.md](docs/contributing.md).
+section of [contributing.md](docs/contributing.md). What is being built
+next, and in what order, is the "Agreed plan" at the top of
+[decisions.md](docs/decisions.md).
 
 ## The short list of things to know
 
@@ -114,7 +116,10 @@ section of [contributing.md](docs/contributing.md).
 - **Durability is asynchronous.** A command is answered before it is on disk.
   A process crash loses nothing. A power cut can lose up to 10 ms (W-70,
   D-12).
-- **A disconnected client's orders stay in the book** (W-01, D-01).
-- **There is no authentication** (W-05, D-02).
+- **A disconnected client's orders stay in the book** until it comes back
+  for them. Cancel on disconnect is decided and next to be built (W-01,
+  D-01).
+- **The login token is sent in the clear.** `planckd --clients` says who may
+  log in, and order entry must run over a private link (S-23, W-08).
 - **The feed has no snapshots.** A subscriber that falls too far behind
   cannot recover (W-10, D-05).

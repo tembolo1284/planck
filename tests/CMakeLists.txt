@@ -39,6 +39,7 @@ planck_add_test(planck_unit_tests LABEL unit SOURCES
     unit/shard_test.cpp
     unit/net_test.cpp
     unit/perf_test.cpp
+    unit/credentials_test.cpp
     unit/journal_test.cpp
 )
 

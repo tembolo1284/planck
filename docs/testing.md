@@ -1,6 +1,6 @@
 # Testing
 
-300 tests. This page says how to run them, what each group proves, and what
+308 tests. This page says how to run them, what each group proves, and what
 is expected of new code.
 
 ## Running
@@ -36,14 +36,14 @@ Each test has a label. `-L` selects by it.
 
 | Label | Count | What it is | Programs |
 |-------|------:|------------|----------|
-| `unit` | 209 | One module at a time, deterministic, fast | `planck_unit_tests`, `planck_apps_tests`, `planck_bench_tests` |
+| `unit` | 215 | One module at a time, deterministic, fast | `planck_unit_tests`, `planck_apps_tests`, `planck_bench_tests` |
 | `property` | 21 | Random runs against an independent model | `planck_property_tests` |
-| `integration` | 44 | More than one thread, or real sockets on loopback | `planck_integration_tests` |
+| `integration` | 46 | More than one thread, or real sockets on loopback | `planck_integration_tests` |
 | `capi` | 21 | The C library, from C++, C and Python | `planck_capi_tests`, `planck_capi_smoke`, two scripts |
 | `e2e` | 2 | The programs as separate processes | `apps_smoke.sh`, `bench_smoke.sh` |
 | `tools` | 3 | The scripts and the house rules | `scripts_smoke.sh`, `check_style.py`, `test_tools.py` |
 
-Sanitizer builds run 299, because the Python test of the C library is
+Sanitizer builds run 307, because the Python test of the C library is
 skipped there. So does a machine without Python's `cffi`.
 
 ### unit (`tests/unit/`)
@@ -61,6 +61,7 @@ skipped there. So does a machine without Python's `cffi`.
 | `net_test.cpp` | Address parsing, TCP and UDP sockets, the poller |
 | `perf_test.cpp` | Histogram buckets and percentiles |
 | `journal_test.cpp` | File format, reader, writer, torn tails, damage in the middle |
+| `credentials_test.cpp` | The clients file: who is permitted, every kind of bad line, limits |
 | `apps_support_test.cpp` | Argument parsing and formatting for the programs |
 | `bench_test.cpp` | Pacer, send log, stopwatch |
 | `capi_test.cpp` | The C interface, including a random run compared with a shard driven directly |
@@ -85,7 +86,7 @@ commands. Do that before a release and after touching `book/` or `engine/`.
 |------|--------|
 | `ring_stress_test.cpp` | Two threads, millions of messages, every one delivered once and in order, for several ring sizes |
 | `shard_thread_test.cpp` | A shard on its own thread through a long random run, with a `FeedAuditor` checking every message |
-| `gateway_test.cpp` | Login, routing, rejects, protocol violations, disconnects, session limits, all over real TCP |
+| `gateway_test.cpp` | Login and who is let in, sessions that outlive connections, routing, rejects, protocol violations, disconnects, connection limits, all over real TCP |
 | `feed_test.cpp` | Sequencing, batching, heartbeats, gaps, retransmission, giving up, and a book rebuilt across a real socket |
 | `full_stack_test.cpp` | Shard, gateway and publisher threads together, with clients on TCP and a subscriber on UDP |
 | `journal_thread_test.cpp` | Shard on one thread and recorder on another: every command reaches the file, in order |
@@ -94,8 +95,10 @@ commands. Do that before a release and after touching `book/` or `engine/`.
 
 `apps_smoke.sh` starts `planckd`, trades through it with `planck-client`,
 watches the feed with `planck-mdtap`, kills the venue with `kill -9`,
-restarts it from the journal and checks that books, feed and session
-numbering carried over. `bench_smoke.sh` runs both benchmark programs and
+restarts it from the journal and checks that books, feed and the ownership
+of resting orders carried over. The venue runs with a clients file, and the
+test checks that a wrong token and an unlisted client are turned away.
+`bench_smoke.sh` runs both benchmark programs and
 checks that their figures add up.
 
 ## Test support (`tests/support/`)
@@ -117,7 +120,7 @@ at a time in a private copy of the repository, rebuilds, and confirms that
 a test fails.
 
 ```bash
-tools/seeded_bugs.py                # all 45, about 20 minutes on two CPUs
+tools/seeded_bugs.py                # all 56, about 25 minutes on two CPUs
 tools/seeded_bugs.py --only capi    # the ones whose label matches
 tools/seeded_bugs.py --list
 ```
@@ -133,8 +136,9 @@ the bug back. `tools_selftest` checks on every test run that each entry's
 pattern still occurs exactly once in the source, so the catalogue cannot
 silently rot.
 
-The catalogue is lopsided: 39 of its 45 entries are in the two newest
-directories (W-51). Backfilling the older modules is open work.
+The catalogue is lopsided: 39 of its 56 entries are in `capi/` and `bench/`
+and 12 are from the session work in `gateway/` (W-51). Backfilling the
+older modules is open work.
 
 ## What is expected of new code
 

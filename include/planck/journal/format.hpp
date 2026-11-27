@@ -25,7 +25,10 @@ static_assert(std::endian::native == std::endian::little,
               "the journal format is little-endian and does no byte swapping");
 
 inline constexpr std::array<char, 8> kMagic = {'P', 'L', 'N', 'K', 'J', 'R', 'N', 'L'};
-inline constexpr std::uint32_t kVersion = 1;
+// Version 2: a record's session is the client id its owner logs in with, the
+// same on every connection. In version 1 it was a number given to one
+// connection, so a version 1 journal cannot say who owns what and is refused.
+inline constexpr std::uint32_t kVersion = 2;
 
 struct FileHeader {
     std::array<char, 8> magic = kMagic;

@@ -20,6 +20,9 @@ BENCH_UNIT = "Bench"
 LOADGEN = "bench/planck_loadgen.cpp"
 BOOK = "include/planck/book/order_book.hpp"
 BOOK_TESTS = "OrderBook|Book|Shard"
+GATEWAY = "src/gateway/gateway.cpp"
+CREDENTIALS = "src/gateway/credentials.cpp"
+LOGIN_TESTS = "Gateway|Credentials|apps_smoke"
 
 BUGS = [
     # ---- the C interface: sizing and holding back ----
@@ -167,8 +170,49 @@ BUGS = [
      "file": "include/planck/ring/spsc.hpp", "tests": "Ring",
      "find": "if ((consumer_.cached_tail - head) < want) {",
      "replace": "if ((consumer_.cached_tail - head) == 0 && want != 0) {"},
-    {"label": "gateway: session ids restart at 1 after a restart (F-08)",
-     "file": "src/gateway/gateway.cpp", "tests": "apps_smoke|Gateway",
-     "find": "next_session_id_ = config.first_session_id;",
-     "replace": "next_session_id_ = 1; static_cast<void>(config.first_session_id);"},
+    # ---- sessions, connections and who may log in ----
+    {"label": "gateway: any token will do", "file": CREDENTIALS, "tests": LOGIN_TESTS,
+     "find": "            return entries_[i].token == token;\n",
+     "replace": "            return (entries_[i].token ^ token) < ~std::uint64_t{0};\n"},
+    {"label": "gateway: an unlisted client is let in", "file": CREDENTIALS, "tests": LOGIN_TESTS,
+     "find": "return entries_[i].token == token;\n        }\n    }\n    return false;",
+     "replace": "return entries_[i].token == token;\n        }\n    }\n    return true;"},
+    {"label": "gateway: the same client listed twice", "file": CREDENTIALS, "tests": LOGIN_TESTS,
+     "find": "    if (listed(client_id)) {\n        return Status::Duplicate;\n    }\n",
+     "replace": ""},
+    {"label": "gateway: half of a bad clients file is kept", "file": CREDENTIALS,
+     "tests": LOGIN_TESTS,
+     "find": "        count_ = before;  // all or nothing\n",
+     "replace": "        static_cast<void>(before);\n"},
+    {"label": "gateway: a client id of 65536 or more wraps round", "file": GATEWAY,
+     "tests": LOGIN_TESTS,
+     "find": "request.client_id == 0 || request.client_id > kMaxSessionId ||",
+     "replace": "request.client_id == 0 || (request.client_id & 0xFFFFU) == 0 ||"},
+    {"label": "gateway: the clients file is not consulted", "file": "apps/planckd.cpp",
+     "tests": "apps_smoke",
+     "find": "config.credentials = options.restricted() ? &venue.credentials : nullptr;",
+     "replace": "config.credentials = nullptr;"},
+    {"label": "gateway: two connections speak for one session", "file": GATEWAY,
+     "tests": LOGIN_TESTS,
+     "find": "} else if (slot_by_session_[request.client_id] != kNoConnection) {",
+     "replace": "} else if (false) {"},
+    {"label": "gateway: a session stays taken after its connection goes", "file": GATEWAY,
+     "tests": LOGIN_TESTS,
+     "find": "        slot_by_session_[connection.session.raw()] = kNoConnection;\n    }\n",
+     "replace": "    }\n"},
+    {"label": "gateway: a refused login stays connected", "file": GATEWAY, "tests": LOGIN_TESTS,
+     "find": "            connection.closing = true;",
+     "replace": "            connection.closing = false;"},
+    {"label": "gateway: the session id answered is the slot", "file": GATEWAY,
+     "tests": LOGIN_TESTS,
+     "find": "accepted.session_id = connection.session.raw();",
+     "replace": "accepted.session_id = slot_of(connection);"},
+    {"label": "gateway: a busy slot in the way means no room", "file": GATEWAY,
+     "tests": LOGIN_TESTS,
+     "find": "for (std::size_t tries = 0; tries < kSlots; ++tries) {\n        Connection& candidate",
+     "replace": "for (std::size_t tries = 0; tries < 1; ++tries) {\n        Connection& candidate"},
+    {"label": "journal: a version 1 journal is replayed", "file": "src/journal/format.cpp",
+     "tests": "Journal",
+     "find": "if (header.version != kVersion ||",
+     "replace": "if (header.version > kVersion ||"},
 ]

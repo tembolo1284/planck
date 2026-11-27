@@ -249,17 +249,23 @@ Two details that were learned the hard way:
 
 One thread that owns every client connection.
 
-- **Sessions.** 1024 slots. A session id is 16 bits, handed out in order and
-  never reused within a run, or across restarts when journaling (W-02,
-  W-76). A client that reconnects is a new session and cannot touch orders
-  from its old one (D-01).
+- **Sessions and connections** (S-24). A session is a client's standing
+  with the venue. Its id is the client id it logs in with, 1 to 65,535, the
+  same on every connection and across restarts, and it is what owns orders
+  in the shard and in the journal. A connection is one TCP link in one of
+  1024 slots. A table maps each session id to the slot of the connection
+  speaking for it, if any. That table is how a report finds its way out,
+  and a report whose session has no connection is dropped and counted
+  (W-01).
 - **Buffers.** 4096 bytes in and 64 KiB out per session, all preallocated.
 - **Slow clients.** A client whose out buffer fills is disconnected. Holding
   its backlog would mean unbounded memory or stalling everyone (D-03).
 - **Per pass:** up to 8 accepts, 4 reads per ready socket, 256 reports per
   shard, one send per session with something to say.
-- **Login** checks the protocol version and that the client id is not
-  already logged in. Nothing else (W-05).
+- **Login** checks the protocol version, that the client id is in range,
+  that it is listed with that token if the venue has a clients file
+  (`Credentials`, S-23), and that no other connection holds the session. A
+  refused login is told why and disconnected (S-25).
 
 ### feed (`include/planck/feed/`)
 
@@ -329,8 +335,8 @@ Order matters, and `apps/planckd.cpp` is the reference.
 3. Each shard replays its journal, if there is one, on its own thread.
 4. The recorder starts. It checks that each journal's next sequence number
    is the one its shard will produce.
-5. The gateway starts, handing out session ids above the highest one the
-   journals mention (F-08).
+5. The gateway starts. The orders the journals rebuilt belong to the same
+   client ids as before, so there is nothing to carry over (S-24).
 6. `ready` is printed.
 
 **Stop** (SIGINT or SIGTERM): shards first, then the gateway and publisher,
@@ -344,8 +350,10 @@ when the shards stop get no answer (W-61).
 | Shards | 16 | `core::kMaxShards` |
 | Symbol ids | 0 to 4095 | `core::kMaxSymbols` |
 | Session slots | 1024 | `core::kMaxSessions` |
-| Sessions over a run | 65,535 | 16-bit `SessionId` |
+| Client ids, which are session ids | 1 to 65,535 | 16-bit `SessionId` |
+| Clients in a clients file | 4,096 | `Credentials::kMaxClients` |
 | Clients connected at once | 256 by default | `GatewayConfig::max_sessions` |
+| Connections over a run | no limit | |
 | Resting orders per shard | 1,048,576 by default, 16,777,215 at most | `ShardConfig::order_capacity`, 24 slot bits |
 | Orders per shard, ever | about 68 billion | 36 sequence bits |
 | Price band | 64 to 262,144 ticks, a power of two | `OrderBook` |
@@ -360,8 +368,8 @@ when the shards stop get no answer (W-61).
 A few open decisions would reach across modules if taken. Know about them
 before designing on top of the current shape.
 
-- **Cancel on disconnect (D-01)** needs the shard to track live orders per
-  session, and a new command kind.
+- **Cancel on disconnect (D-01)**, decided and next, needs the shard to
+  track live orders per session, and a new command kind that is journaled.
 - **Group commit (D-12)** means holding reports until the sync that covers
   them: a path from recorder back to gateway.
 - **Feed snapshots (D-05)** and **journal snapshots (W-72)** are the same

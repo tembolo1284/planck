@@ -31,20 +31,34 @@ One TCP connection per client. Messages follow each other with nothing
 between them. A length or type that is not in this document closes the
 connection.
 
-### Session
+### Sessions and connections
 
-1. Client connects and sends `LoginRequest`.
-2. Venue answers `LoginAccepted` with a session id, or `LoginRejected` and
-   closes.
+A **session** is a client's standing with the venue. Its id is the client id
+the client logs in with, from 1 to 65,535. It owns the client's orders and
+it is the same on every connection and across a restart of the venue. A
+**connection** is one TCP link. At most one connection speaks for a session
+at a time.
+
+1. Client connects and sends `LoginRequest` with its client id and token.
+2. Venue answers `LoginAccepted`, whose session id is the client id. Or it
+   answers `LoginRejected` and closes the connection: another try needs
+   another connection.
 3. Client sends `NewOrder` and `CancelOrder`. Venue sends reports.
 4. Client sends `Logout` or just closes.
 
 An order or cancel before step 2 is answered with `OrderRejected` or
-`CancelRejected`, reason NotLoggedIn. A `Heartbeat` from the client is echoed. The venue sends none
-of its own and never times a client out (W-03).
+`CancelRejected`, reason NotLoggedIn. A `Heartbeat` from the client is
+echoed. The venue sends none of its own and never times a client out
+(W-03).
 
-A session id is not reused. A client that reconnects gets a new one and can
-no longer cancel orders from the old session (D-01).
+A client that connects again is the same owner as before. It can cancel the
+orders it left resting, and it receives their fills from then on. Reports
+produced while it had no connection are not kept for it (W-01, W-04). Its
+orders stay in the book while it is away, until cancel on disconnect is
+built (D-01).
+
+The token is sent in the clear. Order entry belongs on a private link
+(S-23, W-08).
 
 ### Client to venue
 
@@ -54,9 +68,9 @@ no longer cancel orders from the old session (D-01).
 |-------:|-----:|-------|---------|
 | 4 | 2 | `protocol_version` | 1 |
 | 6 | 2 | reserved | |
-| 8 | 4 | `client_id` | Who you are. One login per client id at a time. |
+| 8 | 4 | `client_id` | Who you are, 1 to 65,535. One connection per client id at a time. |
 | 12 | 4 | reserved | |
-| 16 | 8 | `token` | Accepted and ignored today (D-02) |
+| 16 | 8 | `token` | The secret the venue holds for this client id. Ignored by a venue started without `--clients`. |
 
 **Heartbeat**, type 0x04, 4 bytes. Header only. Echoed.
 
@@ -86,17 +100,21 @@ no longer cancel orders from the old session (D-01).
 
 **LoginAccepted**, type 0x02, 8 bytes
 
-| Offset | Size | Field |
-|-------:|-----:|-------|
-| 4 | 2 | `session_id` |
-| 6 | 2 | reserved |
+| Offset | Size | Field | Meaning |
+|-------:|-----:|-------|---------|
+| 4 | 2 | `session_id` | The client id you logged in with |
+| 6 | 2 | reserved | |
 
 **LoginRejected**, type 0x03, 8 bytes
 
 | Offset | Size | Field | Meaning |
 |-------:|-----:|-------|---------|
-| 4 | 1 | `reason` | 0 bad credentials, 1 already logged in, 2 unsupported version, 3 server full |
+| 4 | 1 | `reason` | 0 bad credentials, 1 already logged in, 2 unsupported version, 3 server full (defined, not sent today) |
 | 5 | 3 | reserved | |
+
+Bad credentials covers a client id of zero or above 65,535, a client that
+is not listed, and a wrong token. The three are not told apart, on purpose.
+A venue with no room for another connection closes it without a message.
 
 **OrderAccepted**, type 0x20, 32 bytes
 
@@ -279,7 +297,7 @@ all the bytes of the header or record before the checksum field.
 | Offset | Size | Field | Meaning |
 |-------:|-----:|-------|---------|
 | 0 | 8 | `magic` | `PLNKJRNL` |
-| 8 | 4 | `version` | 1 |
+| 8 | 4 | `version` | 2. Version 1 is refused (S-26). |
 | 12 | 2 | `shard` | |
 | 14 | 2 | `header_bytes` | 64 |
 | 16 | 8 | `fingerprint` | Hash of the shard's configuration. Replay refuses a mismatch. |
@@ -299,7 +317,7 @@ One command, as the shard handled it.
 | 24 | 4 | `price` | |
 | 28 | 4 | `qty` | |
 | 32 | 2 | `symbol` | |
-| 34 | 2 | `session` | |
+| 34 | 2 | `session` | The owner: a client id |
 | 36 | 1 | `kind` | 0 new order, 1 cancel |
 | 37 | 1 | `side` | |
 | 38 | 1 | `type` | |
@@ -320,8 +338,9 @@ for a torn tail, 4 for damage and 1 for unreadable.
 ## Changing the protocol
 
 Any change to a layout here is a protocol change. The golden-bytes tests in
-`tests/unit/wire_test.cpp` and `journal_test.cpp` will fail, on purpose.
-Then:
+`tests/unit/wire_test.cpp` will fail, on purpose. So is a change to what a
+field means, which no test can notice: that is why the journal went to
+version 2 when its session field changed meaning. Then:
 
 1. Bump `wire::kProtocolVersion` or `journal::kVersion`.
 2. Update the `static_assert`s, the golden bytes and this document together.

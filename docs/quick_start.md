@@ -29,7 +29,7 @@ sudo apt install g++ clang cmake ninja-build python3 python3-cffi
 ./build.sh test --checked
 ```
 
-This configures `build/gcc-checked/`, builds everything and runs 300 tests.
+This configures `build/gcc-checked/`, builds everything and runs 308 tests.
 It should end with `100% tests passed`. "checked" is an optimised build with
 every contract tested at run time, which is the right one for tests.
 
@@ -131,7 +131,7 @@ C program needs. `capi/tests/capi_smoke.c` is a complete example, and
 | `build/ holds an old build made without presets` | An older checkout built straight into `build/`. Run `rm -rf build`. |
 | `ninja is not installed` | Install Ninja. The presets use it. |
 | Configure hangs or fails fetching GoogleTest | No network. Install `libgtest-dev`, version 1.14 or later. |
-| 299 tests, not 300 | Python's `cffi` is not installed. Harmless. |
+| 307 tests, not 308 | Python's `cffi` is not installed. Harmless. |
 | `FeedMulticast` reported as skipped | This host does not route multicast. Harmless. |
 | `clang-asan` or `clang-tsan` fails to link | Clang's sanitizer runtime is missing. Install `libclang-rt-dev`. |
 | A test fails only when the machine is busy | Tell us. Several such bugs were real (F-04 to F-06 in weaknesses.md). |

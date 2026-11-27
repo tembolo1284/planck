@@ -37,7 +37,9 @@ constexpr char kUsage[] =
     "planck-client: send orders to a planck venue\n"
     "\n"
     "  --connect ADDRESS:PORT  the venue's order entry port  (127.0.0.1:9000)\n"
-    "  --client-id N           who to log in as              (1)\n"
+    "  --client-id N           who to log in as, 1 to 65535  (1)\n"
+    "  --token N               the secret the venue holds for that client id, if it\n"
+    "                          was started with --clients    (0)\n"
     "  --linger MS             after the input ends, keep listening until the venue\n"
     "                          has been quiet this long      (200)\n"
     "\n"
@@ -92,8 +94,8 @@ std::string_view text_of(wire::CancelReason reason) noexcept {
 
 class Client {
 public:
-    Client(std::uint32_t client_id, std::uint64_t linger_ms) noexcept
-        : client_id_(client_id), linger_ns_(linger_ms * kNanosPerMilli) {}
+    Client(std::uint32_t client_id, std::uint64_t token, std::uint64_t linger_ms) noexcept
+        : client_id_(client_id), token_(token), linger_ns_(linger_ms * kNanosPerMilli) {}
 
     [[nodiscard]] int run(net::Endpoint server, const std::atomic<bool>& stop) noexcept;
 
@@ -123,6 +125,7 @@ private:
 
     net::Socket socket_{};
     std::uint32_t client_id_;
+    std::uint64_t token_;
     std::uint64_t linger_ns_;
     Awaiting awaiting_ = Awaiting::Nothing;
     std::uint64_t sent_at_ = 0;        // when the request being awaited went out
@@ -456,6 +459,7 @@ int Client::run(net::Endpoint server, const std::atomic<bool>& stop) noexcept {
     }
     wire::LoginRequest login{};
     login.client_id = client_id_;
+    login.token = token_;
     if (!send(login, Awaiting::Login)) {
         return kFailed;
     }
@@ -511,14 +515,16 @@ int main(int argc, char** argv) {
     }
     net::Endpoint server{net::kLoopback, apps::kDefaultOrderPort};
     std::uint32_t client_id = 1;
+    std::uint64_t token = 0;
     std::uint64_t linger_ms = 200;
     if (!args.endpoint("--connect", server) ||
-        !args.number<std::uint32_t>("--client-id", client_id, 0, 0xFFFFFFFFU) ||
+        !args.number<std::uint32_t>("--client-id", client_id, 1, 0xFFFFU) ||
+        !args.number<std::uint64_t>("--token", token, 0, ~std::uint64_t{0}) ||
         !args.number<std::uint64_t>("--linger", linger_ms, 0, 600'000) || !args.finish()) {
         return kBadUsage;
     }
 
     // Too big for comfort on the stack, and there is only ever one.
-    static Client client(client_id, linger_ms);
+    static Client client(client_id, token, linger_ms);
     return client.run(server, apps::stop_on_signal());
 }

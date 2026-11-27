@@ -117,6 +117,7 @@ add_library(planck::perf ALIAS planck_perf)
 target_link_libraries(planck_perf PUBLIC planck_core)
 
 add_library(planck_gateway STATIC
+    src/gateway/credentials.cpp
     src/gateway/gateway.cpp
 )
 add_library(planck::gateway ALIAS planck_gateway)

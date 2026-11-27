@@ -124,8 +124,7 @@ TEST(GatewayConfigTest, RejectsBadConfigurations) {
 
 TEST_F(GatewayTest, LoginThenOrderIsAcknowledged) {
     const auto alice = client();
-    const std::uint16_t session = alice->login(1001);
-    EXPECT_NE(session, 0);
+    EXPECT_EQ(alice->login(1001), 1001) << "a session id is the client id";
     EXPECT_EQ(gateway_->active_sessions(), 1U);
 
     alice->send(limit(3, core::Side::Buy, 1000, 10, 77));
@@ -307,15 +306,24 @@ TEST_F(GatewayTest, ServerOnlyMessagesFromAClientEndTheSession) {
     EXPECT_EQ(gateway_->stats().protocol_errors, 1U);
 }
 
+// Send a login that must be refused, and check that the gateway says why
+// and then hangs up.
+void expect_refused(WireClient& client, std::uint32_t client_id, std::uint64_t token,
+                    wire::LoginRejectReason reason) {
+    wire::LoginRequest request{};
+    request.client_id = client_id;
+    request.token = token;
+    client.send(request);
+    EXPECT_EQ(client.expect<wire::LoginRejected>().reason, reason) << "client id " << client_id;
+    EXPECT_TRUE(client.closed_by_server()) << "a refused login must end the connection";
+}
+
 TEST_F(GatewayTest, LoginRules) {
     const auto first = client();
     first->login(42);
 
     const auto same_id = client();
-    wire::LoginRequest request{};
-    request.client_id = 42;
-    same_id->send(request);
-    EXPECT_EQ(same_id->expect<wire::LoginRejected>().reason, wire::LoginRejectReason::AlreadyLoggedIn);
+    expect_refused(*same_id, 42, 0, wire::LoginRejectReason::AlreadyLoggedIn);
 
     const auto old_version = client();
     wire::LoginRequest stale{};
@@ -324,14 +332,65 @@ TEST_F(GatewayTest, LoginRules) {
     old_version->send(stale);
     EXPECT_EQ(old_version->expect<wire::LoginRejected>().reason,
               wire::LoginRejectReason::UnsupportedVersion);
+    EXPECT_TRUE(old_version->closed_by_server());
+
+    // A client id is a session id, so it must fit in one and may not be zero.
+    const auto nobody = client();
+    expect_refused(*nobody, 0, 0, wire::LoginRejectReason::BadCredentials);
+    const auto too_big = client();
+    expect_refused(*too_big, 65'536, 0, wire::LoginRejectReason::BadCredentials);
+    const auto wraps_to_42 = client();
+    expect_refused(*wraps_to_42, 65'536 + 42, 0, wire::LoginRejectReason::BadCredentials);
+    const auto largest = client();
+    EXPECT_EQ(largest->login(65'535), 65'535);
 
     // Logging in twice on one connection is a protocol violation.
-    first->send(request);
+    wire::LoginRequest again{};
+    again.client_id = 42;
+    first->send(again);
     EXPECT_TRUE(first->closed_by_server());
 
     // The id is free again once its holder has gone.
     const auto later = client();
-    EXPECT_NE(later->login(42), 0);
+    EXPECT_EQ(later->login(42), 42);
+    EXPECT_EQ(gateway_->stats().bad_credentials, 3U);
+}
+
+TEST_F(GatewayTest, WithAClientListOnlyTheRightTokenGetsIn) {
+    const auto credentials = std::make_unique<Credentials>();
+    ASSERT_EQ(credentials->add(7, 0xfeedULL), Status::Ok);
+    ASSERT_EQ(credentials->add(8, 0), Status::Ok);
+    GatewayConfig config;
+    config.credentials = credentials.get();
+    start(config);
+
+    const auto wrong_token = client();
+    expect_refused(*wrong_token, 7, 0xfeeeULL, wire::LoginRejectReason::BadCredentials);
+    const auto no_token = client();
+    expect_refused(*no_token, 7, 0, wire::LoginRejectReason::BadCredentials);
+    const auto someone_elses = client();
+    expect_refused(*someone_elses, 8, 0xfeedULL, wire::LoginRejectReason::BadCredentials);
+    const auto not_listed = client();
+    expect_refused(*not_listed, 9, 0xfeedULL, wire::LoginRejectReason::BadCredentials);
+    EXPECT_EQ(gateway_->stats().logins, 0U);
+    EXPECT_EQ(gateway_->stats().bad_credentials, 4U);
+
+    // A refused client reached no shard, before or after the refusal.
+    const auto pushy = client();
+    wire::LoginRequest bad{};
+    bad.client_id = 7;
+    pushy->send(bad);
+    pushy->send(limit(3, core::Side::Buy, 1000, 10, 1));
+    static_cast<void>(pushy->expect<wire::LoginRejected>());
+    EXPECT_TRUE(pushy->closed_by_server());
+    EXPECT_EQ(gateway_->stats().commands_out, 0U);
+
+    const auto seven = client();
+    EXPECT_EQ(seven->login(7, 0xfeedULL), 7);
+    const auto eight = client();
+    EXPECT_EQ(eight->login(8, 0), 8) << "a token of zero is a token like any other";
+    seven->send(limit(3, core::Side::Buy, 1000, 10, 2));
+    EXPECT_EQ(seven->expect<wire::OrderAccepted>().client_order_id, 2U);
 }
 
 TEST_F(GatewayTest, HeartbeatIsEchoedAndLogoutCloses) {
@@ -385,7 +444,7 @@ TEST_F(GatewayTest, SessionLimitIsEnforced) {
 
     // A slot freed by a departure can be taken by a newcomer.
     first->close();
-    for (int i = 0; i < 20000 && gateway_->active_sessions() == 2; ++i) {
+    for (int i = 0; i < 20'000 && gateway_->active_sessions() == 2; ++i) {
         pump();
         ::usleep(100);
     }
@@ -393,39 +452,76 @@ TEST_F(GatewayTest, SessionLimitIsEnforced) {
     EXPECT_NE(fourth->login(4), 0);
 }
 
-TEST_F(GatewayTest, ReconnectingGivesANewIdentity) {
-    auto ghost = client();
-    const std::uint16_t ghost_session = ghost->login(1);
-    ghost->send(limit(3, core::Side::Sell, 1000, 10, 1));
-    const auto left_behind = ghost->expect<wire::OrderAccepted>();
-    ghost->close();
-    for (int i = 0; i < 20000 && gateway_->active_sessions() != 0; ++i) {
+TEST_F(GatewayTest, AReconnectingClientIsTheSameOwner) {
+    auto maker = client();
+    ASSERT_EQ(maker->login(1), 1);
+    maker->send(limit(3, core::Side::Sell, 1000, 10, 1));
+    const auto resting = maker->expect<wire::OrderAccepted>();
+    maker->close();
+    for (int i = 0; i < 20'000 && gateway_->active_sessions() != 0; ++i) {
         pump();
         ::usleep(100);
     }
     ASSERT_EQ(gateway_->active_sessions(), 0U);
 
-    // Same client id, new connection. It must not inherit the old session.
-    const auto returned = client();
-    const std::uint16_t new_session = returned->login(1);
-    EXPECT_NE(new_session, ghost_session);
-
-    wire::CancelOrder cancel{};
-    cancel.order_id = left_behind.order_id;
-    returned->send(cancel);
-    EXPECT_EQ(returned->expect<wire::CancelRejected>().reason, wire::RejectCode::UnknownOrder)
-        << "a new session cancelled an order from a dead one";
-
-    // The abandoned order is still in the book and still trades.
+    // The order goes on working while its owner is away. The owner's report
+    // of this fill has nowhere to go: it is dropped, and counted.
     const auto buyer = client();
     buyer->login(2);
-    buyer->send(limit(3, core::Side::Buy, 1000, 10, 2));
+    buyer->send(limit(3, core::Side::Buy, 1000, 4, 2));
     static_cast<void>(buyer->expect<wire::OrderAccepted>());
-    EXPECT_EQ(buyer->expect<wire::Executed>().qty, 10U);
-
-    // Its fill report has nowhere to go and must not reach the newcomer.
-    EXPECT_TRUE(returned->quiet());
+    EXPECT_EQ(buyer->expect<wire::Executed>().qty, 4U);
     EXPECT_EQ(gateway_->stats().reports_dropped, 1U);
+
+    // Nobody else can touch it meanwhile.
+    wire::CancelOrder cancel{};
+    cancel.order_id = resting.order_id;
+    buyer->send(cancel);
+    EXPECT_EQ(buyer->expect<wire::CancelRejected>().reason, wire::RejectCode::UnknownOrder)
+        << "one client cancelled another's order";
+
+    // Same client id, new connection: the same session, and the same owner.
+    const auto returned = client();
+    EXPECT_EQ(returned->login(1), 1);
+    EXPECT_TRUE(returned->quiet()) << "the fill it missed must not turn up late";
+
+    buyer->send(limit(3, core::Side::Buy, 1000, 1, 3));
+    static_cast<void>(buyer->expect<wire::OrderAccepted>());
+    static_cast<void>(buyer->expect<wire::Executed>());
+    const auto fill = returned->expect<wire::Executed>();
+    EXPECT_EQ(fill.order_id, resting.order_id);
+    EXPECT_EQ(fill.liquidity, wire::Liquidity::Maker);
+    EXPECT_EQ(fill.leaves, 5U);
+
+    returned->send(cancel);
+    const auto canceled = returned->expect<wire::Canceled>();
+    EXPECT_EQ(canceled.order_id, resting.order_id);
+    EXPECT_EQ(canceled.qty, 5U);
+    EXPECT_EQ(gateway_->stats().reports_dropped, 1U);
+}
+
+TEST_F(GatewayTest, ConnectionsCanComeAndGoWithoutLimit) {
+    // More connections than there are slots, and one session throughout.
+    // Every slot gets used again, and the session never wears out.
+    GatewayConfig config;
+    config.max_sessions = 2;
+    start(config);
+    const auto resident = client();
+    ASSERT_EQ(resident->login(9), 9);
+
+    const int rounds = static_cast<int>(core::kMaxSessions) + 100;
+    for (int round = 0; round < rounds; ++round) {
+        const auto visitor = client();
+        ASSERT_EQ(visitor->login(5), 5) << "round " << round;
+        visitor->send(wire::Logout{});
+        ASSERT_TRUE(visitor->closed_by_server()) << "round " << round;
+    }
+    EXPECT_EQ(gateway_->active_sessions(), 1U);
+    EXPECT_EQ(gateway_->stats().logins, static_cast<std::uint64_t>(rounds) + 1);
+
+    resident->send(limit(3, core::Side::Buy, 1000, 10, 1));
+    EXPECT_EQ(resident->expect<wire::OrderAccepted>().client_order_id, 1U)
+        << "the connection that stayed was disturbed by the ones that came and went";
 }
 
 }  // namespace
