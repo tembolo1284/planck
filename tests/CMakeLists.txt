@@ -71,3 +71,25 @@ if(TARGET planckd)
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/e2e/apps_smoke.sh $<TARGET_FILE_DIR:planckd>)
     set_tests_properties(apps_smoke PROPERTIES LABELS e2e TIMEOUT 120)
 endif()
+
+if(TARGET planck-bench)
+    # The small pieces the benchmark programs are built from.
+    planck_add_test(planck_bench_tests LABEL unit SOURCES
+        unit/bench_test.cpp
+    )
+    target_link_libraries(planck_bench_tests PRIVATE planck_bench_support)
+
+    # The benchmark programs end to end. Checks that they run, not how fast.
+    add_test(NAME bench_smoke
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/e2e/bench_smoke.sh
+                     $<TARGET_FILE_DIR:planckd> $<TARGET_FILE_DIR:planck-bench>)
+    set_tests_properties(bench_smoke PROPERTIES LABELS e2e TIMEOUT 120)
+endif()
+
+if(TARGET planck_capi)
+    # The C interface, checked from C++ against the engine it wraps.
+    planck_add_test(planck_capi_tests LABEL capi SOURCES
+        unit/capi_test.cpp
+    )
+    target_link_libraries(planck_capi_tests PRIVATE planck::capi)
+endif()

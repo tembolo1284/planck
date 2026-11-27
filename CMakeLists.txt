@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(planck VERSION 0.1.0 LANGUAGES CXX)
+project(planck VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,7 +13,9 @@ endif()
 
 option(PLANCK_NATIVE "Tune for the build machine (-march=native)" ON)
 option(PLANCK_BUILD_TESTS "Build the test suite (fetches GoogleTest if not installed)" ON)
-option(PLANCK_BUILD_APPS "Build planckd, planck-client and planck-mdtap" ON)
+option(PLANCK_BUILD_APPS "Build planckd, planck-client, planck-mdtap and planck-replay" ON)
+option(PLANCK_BUILD_CAPI "Build libplanck.so, the engine behind a C interface" ON)
+option(PLANCK_BUILD_BENCH "Build planck-bench and planck-loadgen (needs PLANCK_BUILD_APPS)" ON)
 set(PLANCK_SANITIZE "" CACHE STRING "Sanitizers to build with, e.g. address,undefined or thread")
 set(PLANCK_CONTRACTS "auto" CACHE STRING "Contract mode: auto, off, assume, checked")
 set_property(CACHE PLANCK_CONTRACTS PROPERTY STRINGS auto off assume checked)
@@ -29,10 +31,14 @@ if(PLANCK_NATIVE)
     target_compile_options(planck_flags INTERFACE -march=native)
 endif()
 
+# Sanitizer flags on their own, so that code in other languages can be built
+# to match. A program must be built with the sanitizers its libraries use.
+add_library(planck_sanitize INTERFACE)
 if(PLANCK_SANITIZE)
-    target_compile_options(planck_flags INTERFACE -fsanitize=${PLANCK_SANITIZE} -fno-omit-frame-pointer)
-    target_link_options(planck_flags INTERFACE -fsanitize=${PLANCK_SANITIZE})
+    target_compile_options(planck_sanitize INTERFACE -fsanitize=${PLANCK_SANITIZE} -fno-omit-frame-pointer)
+    target_link_options(planck_sanitize INTERFACE -fsanitize=${PLANCK_SANITIZE})
 endif()
+target_link_libraries(planck_flags INTERFACE planck_sanitize)
 
 if(PLANCK_CONTRACTS STREQUAL "off")
     target_compile_definitions(planck_flags INTERFACE PLANCK_CONTRACT_MODE=0)
@@ -132,11 +138,28 @@ add_library(planck_journal STATIC
 add_library(planck::journal ALIAS planck_journal)
 target_link_libraries(planck_journal PUBLIC planck_engine)
 
+# Before any subdirectory, so that tests declared next to the code they
+# check are registered too.
+if(PLANCK_BUILD_TESTS)
+    enable_testing()
+endif()
+
 if(PLANCK_BUILD_APPS)
     add_subdirectory(apps)
 endif()
 
+if(PLANCK_BUILD_CAPI)
+    add_subdirectory(capi)
+endif()
+
+if(PLANCK_BUILD_BENCH)
+    if(PLANCK_BUILD_APPS)
+        add_subdirectory(bench)
+    else()
+        message(STATUS "planck: benchmarks skipped, they need PLANCK_BUILD_APPS=ON")
+    endif()
+endif()
+
 if(PLANCK_BUILD_TESTS)
-    enable_testing()
     add_subdirectory(tests)
 endif()
