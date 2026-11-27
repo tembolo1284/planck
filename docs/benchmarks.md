@@ -12,19 +12,20 @@ it.
 
 1. Build Release. The benchmarks say so on their first line if you did not.
 
-       cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release
-       cmake --build build-release
+       ./build.sh --release
 
-2. Pin the threads, and give them cores nothing else uses. Best is cores
+2. Ask the machine what it thinks of itself: `scripts/check_host.sh`. Every
+   warning it prints is a source of tail latency.
+3. Pin the threads, and give them cores nothing else uses. Best is cores
    taken out of the scheduler at boot with `isolcpus=` and `nohz_full=`.
-3. Not under WSL2 or in a shared virtual machine, where another tenant can
+4. Not under WSL2 or in a shared virtual machine, where another tenant can
    take the core at any moment. See W-30 in `weaknesses.md`.
-4. Look at p99 and beyond, and run more than once. A `max` that moves by a
+5. Look at p99 and beyond, and run more than once. A `max` that moves by a
    factor of ten between runs is the machine, not the engine.
 
 ## planck-bench
 
-    build-release/bench/planck-bench --cpu 2 --cpu2 3
+    build/gcc-release/bench/planck-bench --cpu 2 --cpu2 3
 
 | Option | Meaning |
 |--------|---------|
@@ -56,8 +57,8 @@ Every figure is nanoseconds for one operation.
 
 Start a venue, then point the generator at it.
 
-    build-release/apps/planckd --cpus 2-5 &
-    build-release/bench/planck-loadgen --cpu 6 --sessions 4 --orders 1000000
+    build/gcc-release/apps/planckd --cpus 2-4 &
+    build/gcc-release/bench/planck-loadgen --cpu 6 --sessions 4 --orders 1000000
 
 It logs in `--sessions` connections and sends new orders. Most rest. A share
 set by `--cross` (10 percent by default) cross and trade. Each session
@@ -90,6 +91,20 @@ venue's limit.
 The summary line also reports rejects (and how many were Busy, the venue
 shedding load), fills, cancels, and the most orders any session had
 unanswered at once.
+
+## Keeping and comparing runs
+
+    scripts/bench.sh --cpus 2,3 --venue --venue-cpus 4-6 --loadgen-cpu 7
+
+runs both programs and saves their output as CSV under `bench-results/`,
+with a note of the machine, kernel and compiler. If an earlier run is there
+it compares the new one with it. To compare any two by hand:
+
+    tools/bench_compare.py bench-results/OLD bench-results/NEW
+
+A row is flagged when its median grew by more than 10 percent or its p99 by
+more than 25. On a shared or unpinned machine rows move that much on their
+own, so a flag there is a reason to run again and no more.
 
 ## Results
 

@@ -99,6 +99,13 @@ Things that are simply broken or missing live in `weaknesses.md`.
 - **Leaning:** keep pulling as the default. Offer callbacks as a second mode if the memory matters to someone.
 - **Touches:** W-91.
 
+### D-17 A C++ wrapper on top of the C library
+- **Today:** none. `capi/` is the lower two thirds of the hourglass pattern: a C++ implementation behind a narrow C interface. C++ programs that want the engine link planck's own libraries directly.
+- **Alternative:** add the top of the hourglass: one header, `capi/include/planck.hpp`, that wraps `planck.h` in a move-only `Engine` class with real enum types and ranges over reports and market events. Header only, no exceptions, nothing compiled into the library.
+- **For it:** a C++ program built with a different compiler or standard library could use the engine safely, which planck's own headers do not allow. **Against it:** nobody needs that yet, and it is a second interface to keep in step with the first.
+- **Leaning:** leave it out until something outside this repository wants to use the engine from C++.
+- **Touches:** W-90.
+
 ## Settled
 
 | Id | Decision | Why |
@@ -122,3 +129,6 @@ Things that are simply broken or missing live in `weaknesses.md`.
 | S-17 | `libplanck.so` compiles the engine's sources a second time, as position independent code. The static libraries the venue links are not touched. | Position independence is needed for a shared library and is not free. The venue's hot path should not pay for a library it does not use. |
 | S-18 | `libplanck.so` exports the functions in `planck.h` and nothing else, and needs only the C library at run time. | Internals stay free to change. A C program does not have to load the C++ runtime. Both are checked by a test. |
 | S-19 | A caller's mistake (a null pointer, a side that is neither buy nor sell) comes back as a status and changes nothing. The market's refusal (unknown symbol, price outside the band, book full) comes back as a report. | The first is a bug in the calling program. The second is an ordinary event that a trading program has to handle anyway, the same way it would from the venue. |
+| S-20 | One build directory for each pairing of compiler and build kind, `build/<compiler>-<kind>`, defined once in `CMakePresets.json`. `build.sh` is a front end to the presets and holds no settings of its own. | Switching compiler or build kind never forces a rebuild, and the script, an editor and a bare `cmake --preset` all land in the same place. |
+| S-21 | Five build kinds: release, debug, checked, asan and tsan. "checked" is optimised with contracts on, and is the one tests are meant to run in. | A debug build is too slow for the randomized tests to do much, and a release build assumes its contracts instead of checking them. |
+| S-22 | Tools are Python with no packages beyond the standard library, and scripts are bash. | Nothing to install, and they run on any machine that can build planck. |
