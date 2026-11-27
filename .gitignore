@@ -66,3 +66,10 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Everything build.sh and the presets produce.
+/build/
+# Saved benchmark runs from scripts/bench.sh. Keep the ones worth keeping
+# somewhere else, with a note of the machine they came from.
+/bench-results/
+__pycache__/
