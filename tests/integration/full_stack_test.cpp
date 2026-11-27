@@ -136,10 +136,10 @@ TEST(FullStack, OrdersInFillsOutAndPrintsOnTheFeed) {
             sell.side = std::to_underlying(core::Side::Sell);
             sell.price = price;
             sell.qty = qty;
-            sell.client_order_id = round;
+            sell.client_order_id = round + 1;
             maker.send(sell);
             const auto resting = maker.expect<wire::OrderAccepted>();
-            ASSERT_EQ(resting.client_order_id, round);
+            ASSERT_EQ(resting.client_order_id, round + 1);
 
             wire::NewOrder buy = sell;
             buy.side = std::to_underlying(core::Side::Buy);
@@ -180,7 +180,7 @@ TEST(FullStack, OrdersInFillsOutAndPrintsOnTheFeed) {
     EXPECT_EQ(shard->stats().trades, rounds);
     EXPECT_EQ(shard->store().in_use(), 0U);
     EXPECT_EQ(gateway->stats().commands_out, std::uint64_t{rounds} * 2);
-    EXPECT_EQ(gateway->stats().reports_dropped, 0U);
+    EXPECT_EQ(gateway->stats().reports_unsent, 0U);
     EXPECT_EQ(gateway->stats().protocol_errors, 0U);
     EXPECT_EQ(publisher->stats().messages, std::uint64_t{rounds} * 2);
 }

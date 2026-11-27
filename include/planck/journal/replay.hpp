@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <type_traits>
 
 #include "planck/core/status.hpp"
@@ -15,9 +16,7 @@ namespace planck::journal {
 struct ReplayResult {
     // Commands replayed into the shard.
     std::uint64_t records = 0;
-    // Highest session id any of them carried. A gateway started afterwards
-    // must hand out ids above this, or a new client could be mistaken for
-    // the owner of an old order.
+    // Highest session id any of them carried.
     std::uint16_t max_session = 0;
     // The file ended in a record that never fully reached the disk. It was
     // ignored. That is the normal mark of a crash.
@@ -41,11 +40,16 @@ struct ReplayResult {
 //   Protocol         the journal is damaged somewhere other than its tail.
 //   Unsupported      the journal is from another version of the format.
 //   WouldBlock       gave up waiting for room in the market ring.
-template <typename OnStall>
-    requires std::is_nothrow_invocable_v<OnStall&>
+//
+// on_command() is shown every command once it has been replayed, in order.
+// A venue uses it to learn what the journal says about each session: see
+// note_order_id().
+template <typename OnStall, typename OnCommand>
+    requires std::is_nothrow_invocable_v<OnStall&> &&
+             std::is_nothrow_invocable_v<OnCommand&, const engine::Command&>
 [[nodiscard]] core::Status replay(const char* path, engine::Shard& shard,
                                   std::uint64_t fingerprint, ReplayResult& out,
-                                  OnStall&& on_stall) noexcept {
+                                  OnStall&& on_stall, OnCommand&& on_command) noexcept {
     constexpr std::uint64_t kMaxStalls = std::uint64_t{1} << 32;
     using core::Status;
 
@@ -80,6 +84,7 @@ template <typename OnStall>
                 return Status::WouldBlock;
             }
         }
+        on_command(entry.command);
         ++out.records;
         out.max_session = (entry.command.session.raw() > out.max_session)
                               ? entry.command.session.raw()
@@ -106,6 +111,31 @@ template <typename OnStall>
         return Status::Ok;
     }
     return (status == Status::Closed) ? Status::Ok : status;
+}
+
+// The same, for a caller with no interest in the commands themselves.
+template <typename OnStall>
+    requires std::is_nothrow_invocable_v<OnStall&>
+[[nodiscard]] core::Status replay(const char* path, engine::Shard& shard,
+                                  std::uint64_t fingerprint, ReplayResult& out,
+                                  OnStall&& on_stall) noexcept {
+    return replay(path, shard, fingerprint, out, on_stall,
+                  [](const engine::Command&) noexcept {});
+}
+
+// For on_command: keep, by session id, the highest client order id that any
+// replayed order carried. `highest` has one entry for every session id. A
+// gateway given the result knows an order sent again after a restart for
+// the repeat it is: see gateway::GatewayConfig::last_order_ids.
+inline void note_order_id(const engine::Command& command,
+                          std::span<std::uint64_t> highest) noexcept {
+    if (command.kind != engine::CommandKind::NewOrder) {
+        return;
+    }
+    const std::size_t session = command.session.raw();
+    if (session < highest.size() && command.id > highest[session]) {
+        highest[session] = command.id;
+    }
 }
 
 }  // namespace planck::journal

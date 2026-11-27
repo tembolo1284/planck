@@ -42,6 +42,20 @@ Status validate(const GatewayConfig& config) noexcept {
                                         config.idle_timeout_ms <= config.heartbeat_interval_ms)) {
         return Status::InvalidArgument;
     }
+    // Reports are held in rings, so a power of two, and all or nothing.
+    if ((config.retain_reports == 0) != (config.retain_sessions == 0) ||
+        (config.retain_reports & (config.retain_reports - 1)) != 0) {
+        return Status::InvalidArgument;
+    }
+    if (config.retain_sessions > Gateway::kMaxSessionId ||
+        std::uint64_t{config.retain_reports} * config.retain_sessions >
+            Gateway::kMaxRetainedReports) {
+        return Status::OutOfRange;
+    }
+    if (!config.last_order_ids.empty() &&
+        config.last_order_ids.size() != std::size_t{Gateway::kMaxSessionId} + 1) {
+        return Status::InvalidArgument;
+    }
     return Status::Ok;
 }
 
@@ -89,8 +103,16 @@ Status Gateway::init(const GatewayConfig& config) noexcept {
 
     // One receive and one transmit buffer per slot, touched now so the first
     // message on a new connection does not take a page fault.
-    const std::size_t per_slot = kRxBufferBytes + config.tx_buffer_bytes;
-    if (const Status status = arena_.init(kSlots * per_slot, sys::HugePages::Try); !ok(status)) {
+    // Every allocation starts on a cache line, so each takes whole ones.
+    const auto whole_lines = [](std::size_t bytes) noexcept {
+        return (bytes + core::kCacheLine - 1) / core::kCacheLine * core::kCacheLine;
+    };
+    const std::size_t per_slot = whole_lines(kRxBufferBytes) + whole_lines(config.tx_buffer_bytes);
+    const std::size_t history_bytes =
+        std::size_t{config.retain_reports} * config.retain_sessions * wire::kMaxMessageSize;
+    if (const Status status =
+            arena_.init(kSlots * per_slot + whole_lines(history_bytes), sys::HugePages::Try);
+        !ok(status)) {
         return status;
     }
     for (Connection& connection : connections_) {
@@ -100,8 +122,24 @@ Status Gateway::init(const GatewayConfig& config) noexcept {
             return Status::Capacity;
         }
     }
+    if (history_bytes != 0) {
+        history_ = arena_.allocate(history_bytes, core::kCacheLine);
+        if (history_ == nullptr) {
+            return Status::Capacity;
+        }
+    }
     arena_.prefault();
     slot_by_session_.fill(kNoConnection);
+    history_of_.fill(kNoHistory);
+    next_report_.fill(1);
+    if (!config.last_order_ids.empty()) {
+        std::memcpy(last_order_id_.data(), config.last_order_ids.data(),
+                    last_order_id_.size() * sizeof(std::uint64_t));
+    }
+    retain_reports_ = config.retain_reports;
+    retain_sessions_ = config.retain_sessions;
+    // Never zero, which a client sends to mean "no earlier connection".
+    epoch_ = (config.epoch != 0) ? config.epoch : (sys::wall_now().raw() | 1U);
 
     if (const Status status = poller_.init(); !ok(status)) {
         return status;
@@ -184,6 +222,9 @@ std::size_t Gateway::poll() noexcept {
         check_connections();
     }
     work += route_reports();
+    if (behind_count_ != 0) [[unlikely]] {
+        work += send_held();
+    }
     flush_dirty();
     return work;
 }
@@ -236,6 +277,8 @@ std::size_t Gateway::accept_clients() noexcept {
         connection->open = true;
         connection->closing = false;
         connection->dirty = false;
+        connection->behind = false;
+        connection->next_send = 0;
         connection->rx_length = 0;
         connection->tx_length = 0;
         connection->opened_ns = now_ns_;
@@ -368,6 +411,12 @@ void Gateway::on_login(Connection& connection, const wire::LoginRequest& request
         // last connection ended.
         rejected.reason = wire::LoginRejectReason::AlreadyLoggedIn;
         refused = true;
+    } else if (request.next_report != 0 && request.epoch == epoch_ &&
+               request.next_report > next_report_[request.client_id]) {
+        // It claims to have seen reports that were never sent. Whatever it
+        // has been counting, it was not this session in this run.
+        rejected.reason = wire::LoginRejectReason::BadSequence;
+        refused = true;
     }
     if (refused) {
         // Told why, then dropped. Another try needs another connection.
@@ -385,7 +434,30 @@ void Gateway::on_login(Connection& connection, const wire::LoginRequest& request
     wire::LoginAccepted accepted{};
     accepted.session_id = connection.session.raw();
     accepted.idle_timeout_ms = idle_timeout_ms_;
+
+    // Where this connection takes up the session's reports.
+    const std::uint64_t live = next_report_[connection.session.raw()];
+    const std::uint64_t oldest = oldest_held(connection.session);
+    std::uint64_t start = live;
+    if (request.next_report != 0) {
+        // Numbers from another run mean nothing here: everything held.
+        const std::uint64_t wanted = (request.epoch == epoch_) ? request.next_report : 1;
+        start = (wanted > oldest) ? wanted : oldest;
+        if (request.epoch == epoch_ && start > wanted) {
+            ++stats_.recovery_gaps;
+        }
+    }
+    accepted.epoch = epoch_;
+    accepted.next_report = start;
+    accepted.live_from = live;
+    accepted.last_client_order_id = last_order_id_[connection.session.raw()];
+    connection.next_send = start;
     queue_message(connection, accepted);
+    if (connection.open && start < live) {
+        connection.behind = true;
+        ++behind_count_;
+        ++stats_.recoveries;
+    }
 }
 
 void Gateway::on_new_order(Connection& connection, const wire::NewOrder& order,
@@ -394,6 +466,15 @@ void Gateway::on_new_order(Connection& connection, const wire::NewOrder& order,
         reject_order(connection, order.client_order_id, wire::RejectCode::NotLoggedIn);
         return;
     }
+    // At most once. An id the session has already used is a repeat of an
+    // order the venue already has, and what became of that one is in the
+    // session's reports. From here on this id is used, whatever happens.
+    std::uint64_t& last_order_id = last_order_id_[connection.session.raw()];
+    if (order.client_order_id <= last_order_id) {
+        ++stats_.duplicate_orders;
+        return;
+    }
+    last_order_id = order.client_order_id;
     // The trust boundary. Nothing past this line re-checks these fields.
     if (!wire::well_formed(order)) {
         reject_order(connection, order.client_order_id, wire::RejectCode::Malformed);
@@ -444,8 +525,14 @@ void Gateway::reject_order(Connection& connection, std::uint64_t client_order_id
     wire::OrderRejected message{};
     message.reason = reason;
     message.client_order_id = client_order_id;
-    queue_message(connection, message);
     ++stats_.rejected;
+    const std::span<const std::byte> bytes{reinterpret_cast<const std::byte*>(&message),
+                                           sizeof(message)};
+    if (connection.session.raw() == 0) {
+        queue(connection, bytes);
+    } else {
+        deliver(connection.session, bytes);
+    }
 }
 
 void Gateway::reject_cancel(Connection& connection, std::uint64_t order_id,
@@ -453,8 +540,14 @@ void Gateway::reject_cancel(Connection& connection, std::uint64_t order_id,
     wire::CancelRejected message{};
     message.reason = reason;
     message.order_id = order_id;
-    queue_message(connection, message);
     ++stats_.rejected;
+    const std::span<const std::byte> bytes{reinterpret_cast<const std::byte*>(&message),
+                                           sizeof(message)};
+    if (connection.session.raw() == 0) {
+        queue(connection, bytes);
+    } else {
+        deliver(connection.session, bytes);
+    }
 }
 
 std::size_t Gateway::route_reports() noexcept {
@@ -466,17 +559,98 @@ std::size_t Gateway::route_reports() noexcept {
             if (latency_ != nullptr && r.ingress_tsc != 0 && now_tsc >= r.ingress_tsc) {
                 latency_->record(now_tsc - r.ingress_tsc);
             }
-            Connection* const connection = find(r.session);
-            if (connection == nullptr) {
-                // Its owner has no connection just now.
-                ++stats_.reports_dropped;
-                return;
-            }
-            queue(*connection, {r.bytes.data(), r.length});
-            ++stats_.reports_out;
+            deliver(r.session, {r.bytes.data(), r.length});
         });
     }
     return routed;
+}
+
+std::byte* Gateway::held(core::SessionId session, std::uint64_t number) noexcept {
+    PLANCK_EXPECT(number != 0);
+    if (retain_reports_ == 0) {
+        return nullptr;
+    }
+    std::uint16_t history = history_of_[session.raw()];
+    if (history == kNoHistory) {
+        if (histories_ == retain_sessions_) {
+            return nullptr;  // every block is taken
+        }
+        history = static_cast<std::uint16_t>(histories_);
+        history_of_[session.raw()] = history;
+        ++histories_;
+    }
+    const std::size_t index = std::size_t{history} * retain_reports_ +
+                              static_cast<std::size_t>((number - 1) & (retain_reports_ - 1));
+    return history_ + index * wire::kMaxMessageSize;
+}
+
+std::uint64_t Gateway::oldest_held(core::SessionId session) const noexcept {
+    const std::uint64_t next = next_report_[session.raw()];
+    if (history_of_[session.raw()] == kNoHistory) {
+        return next;
+    }
+    return (next > retain_reports_) ? next - retain_reports_ : 1;
+}
+
+void Gateway::deliver(core::SessionId session, std::span<const std::byte> bytes) noexcept {
+    PLANCK_EXPECT(session.raw() != 0);
+    PLANCK_EXPECT(bytes.size() >= sizeof(wire::MsgHeader) && bytes.size() <= wire::kMaxMessageSize);
+    const std::uint64_t number = next_report_[session.raw()];
+    if (std::byte* const slot = held(session, number); slot != nullptr) {
+        std::memcpy(slot, bytes.data(), bytes.size());
+    }
+    next_report_[session.raw()] = number + 1;
+
+    Connection* const connection = find(session);
+    if (connection == nullptr) {
+        // Its owner has no connection just now.
+        ++stats_.reports_unsent;
+        return;
+    }
+    if (connection->behind) {
+        return;  // it gets this one in its turn, after the ones before it
+    }
+    PLANCK_ASSERT(connection->next_send == number);
+    connection->next_send = number + 1;
+    ++stats_.reports_out;
+    queue(*connection, bytes);
+}
+
+std::size_t Gateway::send_held() noexcept {
+    std::size_t sent = 0;
+    for (Connection& connection : connections_) {
+        if (!connection.open || !connection.behind) {
+            continue;
+        }
+        const core::SessionId session = connection.session;
+        const std::uint64_t live = next_report_[session.raw()];
+        // Each pass sends one report, and no more are held than this.
+        for (std::uint64_t i = 0; i < retain_reports_ && connection.next_send < live; ++i) {
+            if (connection.next_send < oldest_held(session)) {
+                // New reports have overwritten the ones it was waiting for.
+                ++stats_.slow_consumers;
+                disconnect(connection);
+                break;
+            }
+            const std::byte* const slot = held(session, connection.next_send);
+            PLANCK_ASSERT(slot != nullptr);
+            wire::MsgHeader header;
+            std::memcpy(&header, slot, sizeof(header));
+            PLANCK_ASSERT(header.length >= sizeof(header) && header.length <= wire::kMaxMessageSize);
+            if (header.length > tx_capacity_ - connection.tx_length) {
+                break;  // the rest on a later pass, once this much has gone
+            }
+            ++connection.next_send;
+            ++stats_.reports_recovered;
+            ++sent;
+            queue(connection, {slot, header.length});
+        }
+        if (connection.open && connection.behind && connection.next_send == live) {
+            connection.behind = false;
+            --behind_count_;
+        }
+    }
+    return sent;
 }
 
 template <wire::Message T>
@@ -559,6 +733,12 @@ void Gateway::disconnect(Connection& connection) noexcept {
     connection.open = false;
     connection.closing = false;
     connection.dirty = false;
+    if (connection.behind) {
+        connection.behind = false;
+        PLANCK_ASSERT(behind_count_ > 0);
+        --behind_count_;
+    }
+    connection.next_send = 0;
     connection.rx_length = 0;
     connection.tx_length = 0;
     --active_;

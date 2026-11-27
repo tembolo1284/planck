@@ -150,6 +150,21 @@ TEST(GatewayConfigTest, RejectsBadConfigurations) {
         << "a venue that drops silent clients may not be silent itself";
     EXPECT_EQ(timers(100, 65'536), Status::OutOfRange) << "the client is told it in 16 bits";
     EXPECT_EQ(timers(65'536, 0), Status::OutOfRange);
+    const auto holding = [&](std::uint32_t reports, std::uint32_t sessions) {
+        return init_with([=](GatewayConfig& c) {
+            c.retain_reports = reports;
+            c.retain_sessions = sessions;
+        });
+    };
+    EXPECT_EQ(holding(6, 4), Status::InvalidArgument) << "reports are held in rings";
+    EXPECT_EQ(holding(8, 0), Status::InvalidArgument) << "room for reports and nobody to have it";
+    EXPECT_EQ(holding(0, 4), Status::InvalidArgument);
+    EXPECT_EQ(holding(8, 65'536), Status::OutOfRange);
+    EXPECT_EQ(holding(1U << 20, 32), Status::OutOfRange) << "more than a gateway may hold";
+    static constexpr std::uint64_t kTooFew[100] = {};
+    EXPECT_EQ(init_with([](GatewayConfig& c) { c.last_order_ids = kTooFew; }),
+              Status::InvalidArgument)
+        << "an order id for some sessions and not others";
     EXPECT_EQ(init_with([&](GatewayConfig& c) { c.shards = twice; }), Status::Duplicate);
     EXPECT_EQ(init_with([&](GatewayConfig& c) { c.shards = cold; }), Status::InvalidArgument);
     EXPECT_EQ(init_with([](GatewayConfig& c) { c.routes = kWrongShard; }), Status::OutOfRange);
@@ -566,7 +581,7 @@ TEST_F(GatewayTimers, AClientThatIsBeingToldThingsIsNotSentHeartbeatsToo) {
     alice->login(1);
     for (int i = 0; i < 10; ++i) {
         pass(kHeartbeatMs / 2);
-        alice->send(limit(3, core::Side::Buy, 5000, 1, 1));
+        alice->send(limit(3, core::Side::Buy, 5000, 1, static_cast<std::uint64_t>(i) + 1));
         EXPECT_EQ(alice->expect<wire::OrderRejected>().reason, wire::RejectCode::PriceOutOfBand);
     }
     EXPECT_EQ(gateway_->stats().heartbeats_out, 0U);
@@ -644,11 +659,11 @@ TEST_F(GatewayTest, FullCommandRingIsReportedAsBusy) {
 
     const auto alice = client();
     alice->login(1);
-    for (std::uint64_t i = 0; i < 6; ++i) {
+    for (std::uint64_t i = 1; i <= 6; ++i) {
         alice->send(limit(3, core::Side::Buy, 950, 1, i));
     }
     // Nothing is draining the shard, so the fifth and sixth cannot be queued.
-    for (std::uint64_t i = 4; i < 6; ++i) {
+    for (std::uint64_t i = 5; i <= 6; ++i) {
         const auto rejected = alice->expect<wire::OrderRejected>();
         EXPECT_EQ(rejected.reason, wire::RejectCode::Busy);
         EXPECT_EQ(rejected.client_order_id, i);
@@ -657,7 +672,7 @@ TEST_F(GatewayTest, FullCommandRingIsReportedAsBusy) {
 
     // Once the shard runs, the four that were queued are answered.
     shards_running_ = true;
-    for (std::uint64_t i = 0; i < 4; ++i) {
+    for (std::uint64_t i = 1; i <= 4; ++i) {
         EXPECT_EQ(alice->expect<wire::OrderAccepted>().client_order_id, i);
     }
 }
@@ -708,7 +723,7 @@ TEST_F(GatewayTest, ADroppedConnectionCancelsItsOrdersInEveryShard) {
     EXPECT_EQ(shards_[0]->store().in_use(), 1U) << "the bystander's order must stay";
     EXPECT_EQ(shards_[1]->store().in_use(), 0U);
     // The two cancellations were for a client that was no longer there.
-    EXPECT_EQ(gateway_->stats().reports_dropped, 2U);
+    EXPECT_EQ(gateway_->stats().reports_unsent, 2U);
     EXPECT_TRUE(bystander->quiet()) << "one client was told about another's disconnect";
 
     // Nothing is left to trade with at the maker's price.
@@ -753,7 +768,7 @@ TEST_F(GatewayTest, AClientBackBeforeTheShardHasActedHearsItsOrdersCancelled) {
     EXPECT_EQ(second->expect<wire::OrderAccepted>().client_order_id, 2U);
     EXPECT_TRUE(second->quiet());
     EXPECT_EQ(shards_[0]->store().in_use(), 1U);
-    EXPECT_EQ(gateway_->stats().reports_dropped, 0U);
+    EXPECT_EQ(gateway_->stats().reports_unsent, 0U);
 }
 
 TEST_F(GatewayTest, EveryWayOfLeavingCancels) {
@@ -806,7 +821,7 @@ TEST_F(GatewayTest, ACloseThatDoesNotFitIsOwedAndTheSessionWaitsForIt) {
 
     auto leaver = client();
     leaver->login(1);
-    for (std::uint64_t i = 0; i < 4; ++i) {
+    for (std::uint64_t i = 1; i <= 4; ++i) {
         leaver->send(limit(3, core::Side::Buy, 950, 1, i));
     }
     for (int i = 0; i < 50; ++i) {
@@ -888,13 +903,13 @@ TEST_F(GatewayTest, AReconnectingClientIsTheSameOwner) {
     ASSERT_EQ(gateway_->active_sessions(), 0U);
 
     // The order goes on working while its owner is away. The owner's report
-    // of this fill has nowhere to go: it is dropped, and counted.
+    // of this fill has nobody to go to, and that is counted.
     const auto buyer = client();
     buyer->login(2);
     buyer->send(limit(3, core::Side::Buy, 1000, 4, 2));
     static_cast<void>(buyer->expect<wire::OrderAccepted>());
     EXPECT_EQ(buyer->expect<wire::Executed>().qty, 4U);
-    EXPECT_EQ(gateway_->stats().reports_dropped, 1U);
+    EXPECT_EQ(gateway_->stats().reports_unsent, 1U);
 
     // Nobody else can touch it meanwhile.
     wire::CancelOrder cancel{};
@@ -906,7 +921,7 @@ TEST_F(GatewayTest, AReconnectingClientIsTheSameOwner) {
     // Same client id, new connection: the same session, and the same owner.
     const auto returned = client();
     EXPECT_EQ(returned->login(1), 1);
-    EXPECT_TRUE(returned->quiet()) << "the fill it missed must not turn up late";
+    EXPECT_TRUE(returned->quiet()) << "it asked for nothing from before, and must get nothing";
 
     buyer->send(limit(3, core::Side::Buy, 1000, 1, 3));
     static_cast<void>(buyer->expect<wire::OrderAccepted>());
@@ -920,7 +935,7 @@ TEST_F(GatewayTest, AReconnectingClientIsTheSameOwner) {
     const auto canceled = returned->expect<wire::Canceled>();
     EXPECT_EQ(canceled.order_id, resting.order_id);
     EXPECT_EQ(canceled.qty, 5U);
-    EXPECT_EQ(gateway_->stats().reports_dropped, 1U);
+    EXPECT_EQ(gateway_->stats().reports_unsent, 1U);
 }
 
 TEST_F(GatewayTest, ConnectionsCanComeAndGoWithoutLimit) {
@@ -945,6 +960,418 @@ TEST_F(GatewayTest, ConnectionsCanComeAndGoWithoutLimit) {
     resident->send(limit(3, core::Side::Buy, 1000, 10, 1));
     EXPECT_EQ(resident->expect<wire::OrderAccepted>().client_order_id, 1U)
         << "the connection that stayed was disturbed by the ones that came and went";
+}
+
+// ---- numbered reports, recovery, and orders carried out at most once ----
+
+// The same two shards, with a gateway that holds each session's last 64
+// reports, and room in a connection for only two at a time: so that sending
+// held reports takes many passes, as it would to a slow or distant client.
+class GatewayRecovery : public GatewayTest {
+protected:
+    static constexpr std::uint64_t kEpoch = 77;
+    static constexpr std::uint32_t kHeld = 64;
+
+    static GatewayConfig holding(std::uint32_t reports = kHeld, std::uint32_t sessions = 4) {
+        GatewayConfig config;
+        config.retain_reports = reports;
+        config.retain_sessions = sessions;
+        config.epoch = kEpoch;
+        config.tx_buffer_bytes = 2 * wire::kMaxMessageSize;
+        return config;
+    }
+
+    void SetUp() override { start(holding()); }
+
+    // Client 1 offers plenty at 1000 and loses its connection. Client 2 then
+    // buys one lot at a time, `fills` times. So client 1 was sent report 1,
+    // its OrderAccepted, and has missed reports 2 to fills + 1, all fills.
+    wire::OrderAccepted fills_while_away(std::uint32_t fills) {
+        auto maker = client();
+        EXPECT_EQ(maker->resume(1, 0, 0).next_report, 1U);
+        maker->send(limit(3, core::Side::Sell, 1000, 1000, 1));
+        const auto resting = maker->expect<wire::OrderAccepted>();
+        EXPECT_EQ(maker->next_report(), 2U);
+        maker->close();
+        wait_until_nobody_is_connected();
+
+        const auto buyer = client();
+        buyer->login(2);
+        for (std::uint32_t i = 1; i <= fills; ++i) {
+            buyer->send(limit(3, core::Side::Buy, 1000, 1, i));
+            static_cast<void>(buyer->expect<wire::OrderAccepted>());
+            static_cast<void>(buyer->expect<wire::Executed>());
+        }
+        buyer->close();
+        wait_until_nobody_is_connected();
+        return resting;
+    }
+
+    // The next `count` messages must be client 1's fills, in order: each
+    // leaves one lot fewer than the one before.
+    static void expect_fills(WireClient& maker, std::uint32_t first_leaves, std::uint32_t count) {
+        for (std::uint32_t i = 0; i < count && !::testing::Test::HasFailure(); ++i) {
+            ASSERT_EQ(maker.expect<wire::Executed>().leaves, first_leaves - i) << "fill " << i;
+        }
+    }
+};
+
+TEST_F(GatewayRecovery, LoginSaysWhereTheNumbersStand) {
+    EXPECT_EQ(gateway_->epoch(), kEpoch);
+    auto alice = client();
+    wire::LoginAccepted accepted = alice->resume(1, 0, 0);
+    EXPECT_EQ(accepted.epoch, kEpoch);
+    EXPECT_EQ(accepted.next_report, 1U) << "report numbers start at 1";
+    EXPECT_EQ(accepted.live_from, 1U);
+    EXPECT_EQ(accepted.last_client_order_id, 0U);
+
+    alice->send(limit(3, core::Side::Buy, 950, 1, 10));
+    static_cast<void>(alice->expect<wire::OrderAccepted>());
+    alice->send(limit(9, core::Side::Buy, 950, 1, 20));
+    EXPECT_EQ(alice->expect<wire::OrderRejected>().reason, wire::RejectCode::UnknownSymbol);
+    EXPECT_EQ(alice->next_report(), 3U);
+    alice->close();
+    wait_until_nobody_is_connected();
+
+    // A client that asks for nothing from before starts where things stand.
+    alice = client();
+    accepted = alice->resume(1, 0, 0);
+    EXPECT_EQ(accepted.next_report, 3U);
+    EXPECT_EQ(accepted.live_from, 3U);
+    EXPECT_EQ(accepted.last_client_order_id, 20U);
+    EXPECT_TRUE(alice->quiet());
+    EXPECT_EQ(gateway_->stats().recoveries, 0U);
+}
+
+TEST_F(GatewayTest, AGatewayNamesItsOwnRunIfNobodyElseDoes) {
+    EXPECT_NE(gateway_->epoch(), 0U) << "zero is what a client with no earlier connection sends";
+    const auto alice = client();
+    EXPECT_EQ(alice->resume(1, 0, 0).epoch, gateway_->epoch());
+}
+
+TEST_F(GatewayRecovery, WhatIsSaidBeforeLoginHasNoNumber) {
+    const auto alice = client();
+    alice->send(limit(3, core::Side::Buy, 950, 1, 1));
+    EXPECT_EQ(alice->expect<wire::OrderRejected>().reason, wire::RejectCode::NotLoggedIn);
+    const wire::LoginAccepted accepted = alice->resume(1, 0, 0);
+    EXPECT_EQ(accepted.next_report, 1U);
+    EXPECT_EQ(accepted.last_client_order_id, 0U) << "an order from nobody used somebody's id";
+    alice->send(limit(3, core::Side::Buy, 950, 1, 1));
+    EXPECT_EQ(alice->expect<wire::OrderAccepted>().client_order_id, 1U);
+}
+
+TEST_F(GatewayRecovery, AClientIsSentTheReportsItMissed) {
+    const auto resting = fills_while_away(5);
+    EXPECT_EQ(gateway_->stats().reports_unsent, 5U);
+
+    // It had seen report 1 and asks for 2 onwards.
+    const auto maker = client();
+    const wire::LoginAccepted accepted = maker->resume(1, kEpoch, 2);
+    EXPECT_EQ(accepted.next_report, 2U);
+    EXPECT_EQ(accepted.live_from, 7U);
+    expect_fills(*maker, 999, 5);
+    EXPECT_TRUE(maker->quiet()) << "more came than was missed";
+    EXPECT_EQ(maker->next_report(), 7U);
+    EXPECT_EQ(gateway_->stats().recoveries, 1U);
+    EXPECT_EQ(gateway_->stats().reports_recovered, 5U);
+    EXPECT_EQ(gateway_->stats().recovery_gaps, 0U);
+
+    // And then it is an ordinary connection again.
+    wire::CancelOrder cancel{};
+    cancel.order_id = resting.order_id;
+    maker->send(cancel);
+    EXPECT_EQ(maker->expect<wire::Canceled>().qty, 995U);
+    EXPECT_EQ(maker->next_report(), 8U);
+    EXPECT_EQ(gateway_->stats().reports_recovered, 5U);
+}
+
+TEST_F(GatewayRecovery, AClientMayAskAgainForWhatItHasSeen) {
+    const auto resting = fills_while_away(2);
+    const auto maker = client();
+    const wire::LoginAccepted accepted = maker->resume(1, kEpoch, 1);
+    EXPECT_EQ(accepted.next_report, 1U);
+    EXPECT_EQ(accepted.live_from, 4U);
+    EXPECT_EQ(maker->expect<wire::OrderAccepted>().order_id, resting.order_id);
+    expect_fills(*maker, 999, 2);
+    EXPECT_TRUE(maker->quiet());
+}
+
+TEST_F(GatewayRecovery, AClientThatHasMissedNothingIsSentNothing) {
+    static_cast<void>(fills_while_away(2));
+    const auto maker = client();
+    const wire::LoginAccepted accepted = maker->resume(1, kEpoch, 4);
+    EXPECT_EQ(accepted.next_report, 4U);
+    EXPECT_EQ(accepted.live_from, 4U);
+    EXPECT_TRUE(maker->quiet());
+    EXPECT_EQ(gateway_->stats().recoveries, 0U);
+}
+
+TEST_F(GatewayRecovery, ReportsNoLongerHeldAreGoneAndTheClientCanTell) {
+    // 70 fills and the OrderAccepted make 71 reports. The last 64 are held:
+    // numbers 8 to 71.
+    static_cast<void>(fills_while_away(70));
+    const auto maker = client();
+    const wire::LoginAccepted accepted = maker->resume(1, kEpoch, 2);
+    EXPECT_EQ(accepted.next_report, 8U) << "reports 2 to 7 are gone, and this is how it is told";
+    EXPECT_EQ(accepted.live_from, 72U);
+    EXPECT_EQ(gateway_->stats().recovery_gaps, 1U);
+    // Report 8 is the seventh fill, which left 993.
+    expect_fills(*maker, 993, 64);
+    EXPECT_TRUE(maker->quiet());
+    EXPECT_EQ(gateway_->stats().reports_recovered, 64U);
+}
+
+TEST_F(GatewayRecovery, NumbersFromAnotherRunOfTheVenueMeanNothing) {
+    const auto resting = fills_while_away(3);
+    // It counted to 40 before the venue restarted. Here that says nothing
+    // about what it has seen, so it is sent everything held.
+    const auto maker = client();
+    const wire::LoginAccepted accepted = maker->resume(1, kEpoch - 1, 40);
+    EXPECT_EQ(accepted.epoch, kEpoch);
+    EXPECT_EQ(accepted.next_report, 1U);
+    EXPECT_EQ(accepted.live_from, 5U);
+    EXPECT_EQ(maker->expect<wire::OrderAccepted>().order_id, resting.order_id);
+    expect_fills(*maker, 999, 3);
+    EXPECT_EQ(gateway_->stats().recovery_gaps, 0U) << "nobody knows what it missed";
+}
+
+TEST_F(GatewayRecovery, AClientAheadOfTheVenueIsRefused) {
+    static_cast<void>(fills_while_away(2));
+    // Three reports exist, so 4 is the most a client can be waiting for.
+    const auto confused = client();
+    wire::LoginRequest request{};
+    request.client_id = 1;
+    request.epoch = kEpoch;
+    request.next_report = 5;
+    confused->send(request);
+    EXPECT_EQ(confused->expect<wire::LoginRejected>().reason,
+              wire::LoginRejectReason::BadSequence);
+    EXPECT_TRUE(confused->closed_by_server());
+
+    const auto maker = client();
+    EXPECT_EQ(maker->resume(1, kEpoch, 4).next_report, 4U) << "the refusal left a mark";
+}
+
+TEST_F(GatewayRecovery, NewReportsWaitTheirTurnBehindHeldOnes) {
+    static_cast<void>(fills_while_away(60));
+    const auto maker = client();
+    ASSERT_EQ(maker->resume(1, kEpoch, 2).live_from, 62U);
+    // Sixty reports at two a pass: the gateway is still sending them when
+    // this arrives, and the answer to it must come after every one.
+    maker->send(limit(9, core::Side::Buy, 950, 1, 2));
+    expect_fills(*maker, 999, 60);
+    EXPECT_EQ(maker->expect<wire::OrderRejected>().reason, wire::RejectCode::UnknownSymbol);
+    EXPECT_EQ(maker->next_report(), 63U);
+    EXPECT_EQ(gateway_->stats().reports_recovered, 61U)
+        << "the answer did not arrive while the client was behind, so this test showed nothing";
+    EXPECT_EQ(gateway_->stats().slow_consumers, 0U);
+
+    // Once it has caught up, reports go straight out again.
+    const std::uint64_t direct = gateway_->stats().reports_out;
+    maker->send(limit(9, core::Side::Buy, 950, 1, 3));
+    static_cast<void>(maker->expect<wire::OrderRejected>());
+    EXPECT_EQ(gateway_->stats().reports_out, direct + 1);
+    EXPECT_EQ(gateway_->stats().reports_recovered, 61U);
+}
+
+TEST_F(GatewayRecovery, AClientThatFallsBehindWhatIsHeldIsDisconnected) {
+    static_cast<void>(fills_while_away(63));
+    const auto maker = client();
+    ASSERT_EQ(maker->resume(1, kEpoch, 1).next_report, 1U);
+    // While it is still being sent the 64 it missed it earns itself 70 more,
+    // which is more than is held. The ones it was waiting for are
+    // overwritten, and there is no honest way left to carry on.
+    std::array<wire::NewOrder, 70> orders{};
+    for (std::size_t i = 0; i < orders.size(); ++i) {
+        orders[i] = limit(9, core::Side::Buy, 950, 1, 2 + i);
+    }
+    maker->send_bytes(std::as_bytes(std::span{orders}));
+    EXPECT_TRUE(maker->closed_by_server());
+    EXPECT_EQ(gateway_->stats().slow_consumers, 1U);
+
+    // It can come back for what is held now.
+    const auto again = client();
+    const wire::LoginAccepted accepted = again->resume(1, kEpoch, 1);
+    EXPECT_EQ(accepted.live_from, 135U);
+    EXPECT_EQ(accepted.next_report, 71U);
+}
+
+TEST_F(GatewayRecovery, RejectsMadeByTheGatewayAreHeldLikeAnyReport) {
+    auto alice = client();
+    alice->login(1);
+    alice->send(limit(9, core::Side::Buy, 950, 1, 1));
+    static_cast<void>(alice->expect<wire::OrderRejected>());
+    wire::CancelOrder cancel{};
+    cancel.order_id = ~std::uint64_t{0};  // names a shard that does not exist
+    alice->send(cancel);
+    static_cast<void>(alice->expect<wire::CancelRejected>());
+    alice->close();
+    wait_until_nobody_is_connected();
+
+    alice = client();
+    EXPECT_EQ(alice->resume(1, kEpoch, 1).live_from, 3U);
+    const auto order = alice->expect<wire::OrderRejected>();
+    EXPECT_EQ(order.reason, wire::RejectCode::UnknownSymbol);
+    EXPECT_EQ(order.client_order_id, 1U);
+    EXPECT_EQ(alice->expect<wire::CancelRejected>().order_id, cancel.order_id);
+}
+
+TEST_F(GatewayRecovery, AClientLearnsThatItsOrdersWereCancelledWhenItLeft) {
+    cancel_on_disconnect_ = true;
+    start(holding());
+    auto maker = client();
+    maker->login(1);
+    maker->send(limit(3, core::Side::Sell, 1000, 10, 1));
+    const auto resting = maker->expect<wire::OrderAccepted>();
+    maker->close();
+    wait_until_nobody_is_connected();
+    for (int i = 0; i < 50; ++i) {
+        pump();
+    }
+
+    maker = client();
+    const wire::LoginAccepted accepted = maker->resume(1, kEpoch, 2);
+    EXPECT_EQ(accepted.live_from, 3U);
+    const auto canceled = maker->expect<wire::Canceled>();
+    EXPECT_EQ(canceled.order_id, resting.order_id);
+    EXPECT_EQ(canceled.reason, wire::CancelReason::Disconnected);
+}
+
+TEST_F(GatewayTest, WithNothingHeldWhatWasMissedIsGone) {
+    static_cast<void>(shards_);
+    auto alice = client();
+    alice->login(1);
+    alice->send(limit(3, core::Side::Buy, 950, 1, 1));
+    static_cast<void>(alice->expect<wire::OrderAccepted>());
+    alice->close();
+    wait_until_nobody_is_connected();
+
+    // Numbered all the same, so the client can tell that it missed one.
+    alice = client();
+    const wire::LoginAccepted accepted = alice->resume(1, gateway_->epoch(), 1);
+    EXPECT_EQ(accepted.next_report, 2U);
+    EXPECT_EQ(accepted.live_from, 2U);
+    EXPECT_TRUE(alice->quiet());
+    EXPECT_EQ(gateway_->stats().recovery_gaps, 1U);
+    EXPECT_EQ(gateway_->stats().recoveries, 0U);
+}
+
+TEST_F(GatewayRecovery, OnlySoManySessionsHaveReportsHeld) {
+    start(holding(kHeld, 1));
+    const auto report_and_leave = [this](std::uint32_t id) {
+        const auto who = client();
+        who->login(id);
+        who->send(limit(3, core::Side::Buy, 950, 1, 1));
+        static_cast<void>(who->expect<wire::OrderAccepted>());
+        who->close();
+        wait_until_nobody_is_connected();
+    };
+    report_and_leave(1);  // takes the only room there is
+    report_and_leave(2);
+
+    const auto first = client();
+    EXPECT_EQ(first->resume(1, kEpoch, 1).next_report, 1U);
+    EXPECT_EQ(first->expect<wire::OrderAccepted>().client_order_id, 1U);
+    const auto second = client();
+    EXPECT_EQ(second->resume(2, kEpoch, 1).next_report, 2U) << "held with no room to hold it";
+    EXPECT_TRUE(second->quiet());
+}
+
+TEST_F(GatewayRecovery, OneSessionsReportsAreNotAnothers) {
+    static_cast<void>(fills_while_away(3));
+    // Client 2 was there throughout and saw its six reports. Asked from 1
+    // it gets its own six back, not client 1's four.
+    const auto buyer = client();
+    const wire::LoginAccepted accepted = buyer->resume(2, kEpoch, 1);
+    EXPECT_EQ(accepted.live_from, 7U);
+    for (std::uint64_t i = 1; i <= 3; ++i) {
+        EXPECT_EQ(buyer->expect<wire::OrderAccepted>().client_order_id, i);
+        EXPECT_EQ(buyer->expect<wire::Executed>().liquidity, wire::Liquidity::Taker);
+    }
+    EXPECT_TRUE(buyer->quiet());
+}
+
+TEST_F(GatewayTest, AnOrderSentTwiceIsCarriedOutOnce) {
+    const auto alice = client();
+    alice->login(1);
+    alice->send(limit(3, core::Side::Buy, 950, 1, 5));
+    EXPECT_EQ(alice->expect<wire::OrderAccepted>().client_order_id, 5U);
+    alice->send(limit(3, core::Side::Buy, 950, 1, 5));  // the same again
+    alice->send(limit(3, core::Side::Buy, 950, 1, 4));  // and one from before it
+    alice->send(limit(3, core::Side::Buy, 950, 1, 0));
+    EXPECT_TRUE(alice->quiet()) << "a repeat is not answered: the answer is in the reports";
+    EXPECT_EQ(gateway_->stats().duplicate_orders, 3U);
+    EXPECT_EQ(shards_[0]->stats().accepted, 1U);
+    EXPECT_EQ(gateway_->stats().commands_out, 1U);
+
+    alice->send(limit(3, core::Side::Buy, 950, 1, 6));
+    EXPECT_EQ(alice->expect<wire::OrderAccepted>().client_order_id, 6U);
+}
+
+TEST_F(GatewayTest, AnOrderIdStaysUsedOnTheNextConnection) {
+    auto alice = client();
+    alice->login(1);
+    alice->send(limit(3, core::Side::Buy, 950, 1, 5));
+    static_cast<void>(alice->expect<wire::OrderAccepted>());
+    alice->close();
+    wait_until_nobody_is_connected();
+
+    // Did the order arrive before the line dropped? The client need not
+    // know. It sends it again, and the venue has it once.
+    alice = client();
+    EXPECT_EQ(alice->resume(1, 0, 0).last_client_order_id, 5U);
+    alice->send(limit(3, core::Side::Buy, 950, 1, 5));
+    EXPECT_TRUE(alice->quiet());
+    EXPECT_EQ(shards_[0]->stats().accepted, 1U);
+    alice->send(limit(3, core::Side::Buy, 950, 1, 6));
+    EXPECT_EQ(alice->expect<wire::OrderAccepted>().client_order_id, 6U);
+
+    // Another session's ids are its own business.
+    const auto bob = client();
+    EXPECT_EQ(bob->resume(2, 0, 0).last_client_order_id, 0U);
+    bob->send(limit(3, core::Side::Buy, 950, 1, 5));
+    EXPECT_EQ(bob->expect<wire::OrderAccepted>().client_order_id, 5U);
+}
+
+TEST_F(GatewayTest, AnOrderIdIsUsedEvenIfTheOrderWasRefused) {
+    const auto alice = client();
+    alice->login(1);
+    alice->send(limit(9, core::Side::Buy, 950, 1, 1));
+    EXPECT_EQ(alice->expect<wire::OrderRejected>().reason, wire::RejectCode::UnknownSymbol);
+    wire::NewOrder nonsense = limit(3, core::Side::Buy, 950, 1, 2);
+    nonsense.side = 9;
+    alice->send(nonsense);
+    EXPECT_EQ(alice->expect<wire::OrderRejected>().reason, wire::RejectCode::Malformed);
+
+    // Every order with a new id gets exactly one answer, and both of these
+    // have had theirs.
+    alice->send(limit(3, core::Side::Buy, 950, 1, 1));
+    alice->send(limit(3, core::Side::Buy, 950, 1, 2));
+    EXPECT_TRUE(alice->quiet());
+    EXPECT_EQ(gateway_->stats().duplicate_orders, 2U);
+    EXPECT_EQ(shards_[0]->stats().accepted, 0U);
+}
+
+TEST_F(GatewayTest, AVenueToldOfEarlierOrderIdsKnowsARepeat) {
+    // What a venue that has replayed its journal passes on.
+    static std::array<std::uint64_t, Gateway::kMaxSessionId + 1> earlier{};
+    earlier[1] = 40;
+    earlier[Gateway::kMaxSessionId] = 7;
+    GatewayConfig config;
+    config.last_order_ids = earlier;
+    start(config);
+
+    const auto alice = client();
+    EXPECT_EQ(alice->resume(1, 0, 0).last_client_order_id, 40U);
+    alice->send(limit(3, core::Side::Buy, 950, 1, 40));
+    EXPECT_TRUE(alice->quiet()) << "an order from before the restart was carried out again";
+    alice->send(limit(3, core::Side::Buy, 950, 1, 41));
+    EXPECT_EQ(alice->expect<wire::OrderAccepted>().client_order_id, 41U);
+
+    const auto last = client();
+    EXPECT_EQ(last->resume(Gateway::kMaxSessionId, 0, 0).last_client_order_id, 7U);
+    const auto bob = client();
+    EXPECT_EQ(bob->resume(2, 0, 0).last_client_order_id, 0U);
 }
 
 }  // namespace

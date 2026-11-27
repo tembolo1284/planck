@@ -53,12 +53,27 @@ public:
 
     // Log in and return the session id the gateway answered with.
     std::uint16_t login(std::uint32_t client_id, std::uint64_t token = 0) {
+        return resume(client_id, 0, 0, token).session_id;
+    }
+
+    // Log in asking for the session's reports from next_report on, as
+    // counted in the given epoch, and return the gateway's whole answer.
+    wire::LoginAccepted resume(std::uint32_t client_id, std::uint64_t epoch,
+                               std::uint64_t next_report, std::uint64_t token = 0) {
         wire::LoginRequest request{};
         request.client_id = client_id;
         request.token = token;
+        request.epoch = epoch;
+        request.next_report = next_report;
         send(request);
-        return expect<wire::LoginAccepted>().session_id;
+        const wire::LoginAccepted accepted = expect<wire::LoginAccepted>();
+        reports_ = accepted.next_report;
+        return accepted;
     }
+
+    // The number the next report will have, counted the way the protocol
+    // says a client must: from LoginAccepted, one for every report since.
+    [[nodiscard]] std::uint64_t next_report() const { return reports_; }
 
     // The next message from the server, which must be a T.
     template <wire::Message T>
@@ -73,6 +88,7 @@ public:
             if (frame.type == T::kType) {
                 EXPECT_EQ(wire::decode(frame.bytes, message), core::Status::Ok);
             }
+            reports_ += wire::is_report(frame.type) ? 1U : 0U;
             consume(frame.bytes.size());
         }
         return message;
@@ -157,6 +173,7 @@ private:
     net::Socket socket_;
     std::array<std::byte, 16384> buffer_{};
     std::size_t length_ = 0;
+    std::uint64_t reports_ = 0;
     bool closed_ = false;
 };
 

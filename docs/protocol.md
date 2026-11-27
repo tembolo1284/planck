@@ -8,7 +8,7 @@ and offset given here.
 
 ## Common rules
 
-- Protocol version 2. A client that logs in with any other is refused.
+- Protocol version 3. A client that logs in with any other is refused.
 - Every integer is little-endian. There is no padding inside a message.
 - Reserved bytes must be zero when sent. The venue rejects a client message
   whose reserved bytes are not zero.
@@ -39,12 +39,16 @@ it is the same on every connection and across a restart of the venue. A
 **connection** is one TCP link. At most one connection speaks for a session
 at a time.
 
-1. Client connects and sends `LoginRequest` with its client id and token.
+1. Client connects and sends `LoginRequest` with its client id and token,
+   and the number of the first report it has not seen, if it has been
+   connected before.
 2. Venue answers `LoginAccepted`, whose session id is the client id. Or it
    answers `LoginRejected` and closes the connection: another try needs
    another connection.
-3. Client sends `NewOrder` and `CancelOrder`. Venue sends reports.
-4. Client sends `Logout` or just closes.
+3. Venue sends the reports the client missed, if it asked and they are
+   still held.
+4. Client sends `NewOrder` and `CancelOrder`. Venue sends reports.
+5. Client sends `Logout` or just closes.
 
 An order or cancel before step 2 is answered with `OrderRejected` or
 `CancelRejected`, reason NotLoggedIn.
@@ -76,15 +80,15 @@ cancelled. It does not matter how it ends: a `Logout`, a close, a broken
 line the kernel has noticed, or the venue dropping the client for a
 protocol error or for not reading its reports. Each cancelled order is
 taken off the market data feed. A `Canceled` with reason 2 is produced for
-its owner too, but reports are not kept (W-04), so the owner sees it only
-if it has already connected again by then. Usually it has not. Orders the
-client had sent just before the end are carried out first and then
-cancelled like the rest.
+its owner too, and held for it like any report it was not there to read.
+Orders the client had sent just before the end are carried out first and
+then cancelled like the rest.
 
 So a client that connects again is the same session, with nothing resting.
-It is not told what filled before the line dropped. A client that logs in
-again at once may be refused with "already logged in" for a moment, while
-the venue finishes closing its last connection: try again.
+What filled before the line dropped, and what was cancelled after, it
+learns by asking for the reports it missed: see the next section. A client
+that logs in again at once may be refused with "already logged in" for a
+moment, while the venue finishes closing its last connection: try again.
 
 A venue that restarts cancels every resting order before it accepts a
 connection (S-28).
@@ -95,17 +99,91 @@ described above, and treated the same way.
 The token is sent in the clear. Order entry belongs on a private link
 (S-23, W-08).
 
+### Report numbers and recovery
+
+The venue numbers the **reports** it sends a session: `OrderAccepted`,
+`OrderRejected`, `Executed`, `Canceled` and `CancelRejected`, from the
+moment the session has logged in. The first is 1 and each is one more than
+the last, across however many connections the session uses. Nothing else
+is numbered: not `LoginAccepted`, not `Heartbeat`, not a reject sent to a
+connection that has not logged in.
+
+**The numbers are not on the wire.** TCP loses nothing and reorders nothing
+within a connection, so `LoginAccepted` says what number the next report
+has (`next_report`) and the client counts from there, adding one for each
+report it reads. `wire::is_report()` says which types to count. A client
+that keeps that one number knows exactly what it has seen.
+
+**To recover**, a client that connects again puts the number it expects
+next in `LoginRequest.next_report`, with the `epoch` its last
+`LoginAccepted` gave it. The venue then sends every report from that
+number on, in order, before anything new. `LoginAccepted.live_from` is the
+number the first new report will have, so the client knows when it has
+caught up: the reports from `next_report` up to `live_from` are the old
+ones. New reports produced meanwhile wait their turn behind them.
+
+| `LoginRequest` says | The venue sends |
+|---------------------|-----------------|
+| `next_report` 0 | Nothing from before. `next_report` and `live_from` in the answer are equal. |
+| `next_report` N, `epoch` the venue's own | Reports N onwards, or from the oldest still held if N is older. |
+| `next_report` N, any other `epoch` | Every report still held, as if N were 1. |
+| `next_report` above what exists, `epoch` the venue's own | `LoginRejected`, reason 4. The client has miscounted, or is not who it says. |
+
+**What is held.** The venue holds the last `--retain-reports` reports of
+each session, 1024 unless told otherwise, in memory (S-33). A client that
+asks for older ones is not refused: `LoginAccepted.next_report` comes back
+higher than what it asked for, and the reports in between are gone. That is
+the only signal, so compare the two. A client that is connected and falls
+further behind than what is held is disconnected as too slow.
+
+**The epoch** names one run of the venue. Report numbers start again at 1
+when the venue restarts, and nothing held survives (W-98). A client whose
+`epoch` is not the venue's is told so by the `epoch` in the answer, and is
+sent everything the new run holds for it: at least the `Canceled` for each
+order the restart took off the book (S-28). It should take the restart as
+having cancelled everything it had resting, and reconcile fills from
+before it by order id and match id, or from the journal.
+
+### Sending an order again
+
+A client that loses its connection after sending an order cannot know
+whether the order arrived. It does not need to. **`client_order_id` must be
+above every id the session has sent before**, on any connection, and a
+`NewOrder` whose id is not is taken for a repeat and ignored: no answer, no
+second order (S-34). So the rule for a client is:
+
+1. Number orders 1, 2, 3 and so on, and never reuse a number.
+   `LoginAccepted.last_client_order_id` is the highest the venue has had, so
+   a client that has lost its own count carries on from there.
+2. After connecting again, recover the reports. They show what became of
+   every order that arrived.
+3. Send again, with the same ids and in the same order, any order that has
+   no report. The ones that did arrive are ignored. The others are new.
+
+An id is used as soon as the venue has read it from a logged-in connection,
+whatever became of the order. One that was rejected, even with Busy, is
+used: try again with the next id. Zero is never above anything, so ids
+start at 1. The venue remembers the highest id across a restart, from its
+journal, for every order that reached a matching shard.
+
+A repeat gets no answer because the answer already exists: it is the
+report of the original, which the client can ask for. An order sent with
+an id below one it skipped earlier is also ignored, and that one has no
+report anywhere, so send in order.
+
 ### Client to venue
 
-**LoginRequest**, type 0x01, 24 bytes
+**LoginRequest**, type 0x01, 40 bytes
 
 | Offset | Size | Field | Meaning |
 |-------:|-----:|-------|---------|
-| 4 | 2 | `protocol_version` | 1 |
+| 4 | 2 | `protocol_version` | 3 |
 | 6 | 2 | reserved | |
 | 8 | 4 | `client_id` | Who you are, 1 to 65,535. One connection per client id at a time. |
 | 12 | 4 | reserved | |
 | 16 | 8 | `token` | The secret the venue holds for this client id. Ignored by a venue started without `--clients`. |
+| 24 | 8 | `epoch` | From the `LoginAccepted` of an earlier connection. 0 if there was none. |
+| 32 | 8 | `next_report` | The number of the first report you have not seen. 0: send nothing from before. 1: send everything held. |
 
 **Heartbeat**, type 0x04, 4 bytes. Header only. Either side may send it.
 Nobody answers it.
@@ -119,7 +197,7 @@ Nobody answers it.
 | 4 | 2 | `symbol_id` | |
 | 6 | 1 | `side` | 0 buy, 1 sell |
 | 7 | 1 | `order_type` | 0 limit, 1 market |
-| 8 | 8 | `client_order_id` | Yours. Echoed in the answer, never interpreted. |
+| 8 | 8 | `client_order_id` | Yours, and above every one this session has sent before. Echoed in the answer. An order whose id is not above the last is ignored. |
 | 16 | 4 | `price` | Ticks. Ignored for a market order. |
 | 20 | 4 | `qty` | Greater than zero |
 | 24 | 1 | `tif` | 0 day, 1 immediate or cancel, 2 fill or kill |
@@ -134,18 +212,22 @@ Nobody answers it.
 
 ### Venue to client
 
-**LoginAccepted**, type 0x02, 8 bytes
+**LoginAccepted**, type 0x02, 40 bytes
 
 | Offset | Size | Field | Meaning |
 |-------:|-----:|-------|---------|
 | 4 | 2 | `session_id` | The client id you logged in with |
 | 6 | 2 | `idle_timeout_ms` | The venue ends a connection it hears nothing on for this long. 0: it never does. |
+| 8 | 8 | `epoch` | This run of the venue. Never 0. Keep it with your report count. |
+| 16 | 8 | `next_report` | The number of the first report this connection will carry. Count from here. |
+| 24 | 8 | `live_from` | The number the first new report will have. Those below it are from before this login. |
+| 32 | 8 | `last_client_order_id` | The highest order id the venue has had from this session |
 
 **LoginRejected**, type 0x03, 8 bytes
 
 | Offset | Size | Field | Meaning |
 |-------:|-----:|-------|---------|
-| 4 | 1 | `reason` | 0 bad credentials, 1 already logged in, 2 unsupported version, 3 server full (defined, not sent today) |
+| 4 | 1 | `reason` | 0 bad credentials, 1 already logged in, 2 unsupported version, 3 server full (defined, not sent today), 4 bad sequence: `next_report` is above any report that exists |
 | 5 | 3 | reserved | |
 
 Bad credentials covers a client id of zero or above 65,535, a client that
@@ -228,7 +310,8 @@ A venue with no room for another connection closes it without a message.
 | Anything refused | `OrderRejected` only |
 | Cancel of your resting order | `Canceled`, reason 0 |
 | Cancel of anything else | `CancelRejected`, reason 5 |
-| Nothing: your connection ends | `Canceled`, reason 2, for each order you had resting. You will rarely be there to read them. |
+| Nothing: your connection ends | `Canceled`, reason 2, for each order you had resting. Ask for them when you are back. |
+| A `NewOrder` with an id you have used | Nothing |
 
 The owner of a resting order that gets hit receives an `Executed` with
 liquidity 0, with no warning before it.
@@ -395,3 +478,7 @@ The order entry protocol went to version 2 when heartbeats stopped being
 answered and `LoginAccepted` gained the idle timeout. The second of those
 used bytes that were reserved, so no size changed. The first changed what
 a correct client does, and that is a new version however small it looks.
+
+It went to version 3 when reports were numbered. `LoginRequest` and
+`LoginAccepted` both grew to 40 bytes, and a client order id stopped being
+the client's own business: the venue now reads it.

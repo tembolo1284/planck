@@ -16,8 +16,8 @@ these documents brought up to date.
 | 1 | Sessions that outlive connections, and a list of who may log in | D-02, W-02, W-05 | done: S-23, S-24 |
 | 2 | Cancel on disconnect, and at restart | D-01, D-14, W-01 | done: S-27, S-28 |
 | 3a | Heartbeats, and dropping a connection that has gone silent | W-03 | done: S-31, S-32 |
-| 3b | Report sequence numbers, report recovery, idempotent orders | W-04, D-18 | next |
-| 4 | A commit boundary: nothing is told to anyone before it is durable. Measure the cost first. | D-12, D-13, W-70, W-71, W-80 | |
+| 3b | Report sequence numbers, report recovery, idempotent orders | W-04 | done: S-33, S-34, S-35 |
+| 4 | A commit boundary: nothing is told to anyone before it is durable. Measure the cost first. Held reports that survive a restart. | D-12, D-13, W-70, W-71, W-80, W-98 | next |
 | 5 | Feed snapshots and a separate, rate-limited recovery service | D-05, W-10, W-11, W-13 | |
 | 6 | A failed market data consumer must not stop matching | W-21 | |
 | any time | Measure on real hardware | W-50 | |
@@ -108,9 +108,9 @@ of its own.
 
 ### D-18 Letting a client keep its orders working while it is away
 - **Today:** no. Every client's resting orders are cancelled when its connection ends (S-27).
-- **Alternative:** a client says at login that its orders should stay. That is only safe once a returning client can be told everything that happened to them meanwhile, which needs report sequence numbers and recovery (W-04).
-- **Leaning:** offer it after step 3 of the plan, and never as the default.
-- **Touches:** W-04.
+- **Alternative:** a client says at login that its orders should stay. That is only safe if a returning client can be told everything that happened to them meanwhile. Within one run of the venue it now can (S-33). Across a restart it cannot (W-98), and a restart cancels everything anyway (S-28).
+- **Leaning:** offer it after step 4 of the plan, when held reports survive a restart, and never as the default.
+- **Touches:** W-98, W-99.
 
 ### D-19 A limit on how many orders one session may have resting
 - **Today:** none. One session may fill the whole store, and closing it then cancels all of that in one command, during which the shard serves nobody else.
@@ -155,3 +155,6 @@ of its own.
 | S-30 | Journal format 3: two more kinds of record, for one session closing and for all of them. Formats 1 and 2 are refused. | A format 2 reader would stop at the new records, and a format 2 journal was written by shards that kept orders, so it would rebuild books that this venue would never have had. |
 | S-31 | Silence ends a connection. The venue drops a connection it has heard nothing on for its idle timeout (five seconds by default), and one that has not logged in by then. It tells each client the timeout at login. It sends a heartbeat to any client it has sent nothing else for its heartbeat interval (one second by default). A venue that drops silent clients may not be silent itself. The gateway judges silence by its own clock and only while it is itself running. (Was W-03.) | Without it a line that dies quietly is never noticed, and cancel on disconnect does nothing in exactly the case it is for. Telling the client the timeout means no client has to guess. Giving everyone a fresh start after the gateway was held up means a pause of the venue's own cannot cancel every order in the book. |
 | S-32 | Nobody answers a heartbeat. Order entry protocol version 2. | Two ends that both answered would never stop, and one that answers gives a stranger a way to make the venue send. A heartbeat's arrival is the whole of its meaning. Version 1 clients expected an echo, so they are refused. |
+| S-33 | Every report to a session is numbered, from 1, across its connections. The numbers are not on the wire: `LoginAccepted` says what the next one is and the client counts. The gateway holds each session's latest reports in memory (`--retain-reports`, 1024) and a client that says at login which number it expects next is sent the rest first. Order entry protocol version 3. | It is the least that lets a client on a bad line know what happened to its orders. Counting costs no bytes and no change to any report, and TCP makes it exact. Holding a fixed number per session keeps memory bounded and off the heap. A client that asks for more than is held is told by where the numbers resume, not refused, because it still needs what there is. |
+| S-34 | An order is carried out at most once. A session's client order ids must go up, the gateway remembers the highest, and a `NewOrder` that is not above it is ignored without an answer. An id is used as soon as the gateway reads it. After a restart the highest ids come from the journals. | A client that cannot tell whether an order arrived can send it again and be right either way. The gateway judges, not a shard, because only it sees one session's orders in the order they were sent. No answer to a repeat, because the answer is the original's report, which the client can ask for. One number per session is all it costs. |
+| S-35 | Report numbers belong to one run of the venue, named by an epoch that every `LoginAccepted` carries. A restart starts them again at 1 and holds nothing from before. | The numbers are given out by the gateway as reports arrive from the shards, and that interleaving is in no journal. Each shard's journal can rebuild its own reports but not the order a session saw them in, so numbers rebuilt after a restart would not be the ones clients counted. Saying so with an epoch is honest. Recording the gateway's stream is step 4. |

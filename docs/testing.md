@@ -1,6 +1,6 @@
 # Testing
 
-332 tests. This page says how to run them, what each group proves, and what
+354 tests. This page says how to run them, what each group proves, and what
 is expected of new code.
 
 ## Running
@@ -36,14 +36,14 @@ Each test has a label. `-L` selects by it.
 
 | Label | Count | What it is | Programs |
 |-------|------:|------------|----------|
-| `unit` | 225 | One module at a time, deterministic, fast | `planck_unit_tests`, `planck_apps_tests`, `planck_bench_tests` |
-| `property` | 22 | Random runs against an independent model | `planck_property_tests` |
-| `integration` | 59 | More than one thread, or real sockets on loopback | `planck_integration_tests` |
+| `unit` | 226 | One module at a time, deterministic, fast | `planck_unit_tests`, `planck_apps_tests`, `planck_bench_tests` |
+| `property` | 23 | Random runs against an independent model | `planck_property_tests` |
+| `integration` | 79 | More than one thread, or real sockets on loopback | `planck_integration_tests` |
 | `capi` | 21 | The C library, from C++, C and Python | `planck_capi_tests`, `planck_capi_smoke`, two scripts |
 | `e2e` | 2 | The programs as separate processes | `apps_smoke.sh`, `bench_smoke.sh` |
 | `tools` | 3 | The scripts and the house rules | `scripts_smoke.sh`, `check_style.py`, `test_tools.py` |
 
-Sanitizer builds run 331, because the Python test of the C library is
+Sanitizer builds run 353, because the Python test of the C library is
 skipped there. So does a machine without Python's `cffi`.
 
 ### unit (`tests/unit/`)
@@ -88,7 +88,7 @@ for ever on a single thread, which no shorter run had hit.
 |------|--------|
 | `ring_stress_test.cpp` | Two threads, millions of messages, every one delivered once and in order, for several ring sizes |
 | `shard_thread_test.cpp` | A shard on its own thread through a long random run, with a `FeedAuditor` checking every message |
-| `gateway_test.cpp` | Login and who is let in, sessions that outlive connections, cancel on disconnect, heartbeats and silence, routing, rejects, protocol violations, connection limits, all over real TCP |
+| `gateway_test.cpp` | Login and who is let in, sessions that outlive connections, cancel on disconnect, heartbeats and silence, numbered reports and their recovery, orders sent twice, routing, rejects, protocol violations, connection limits, all over real TCP |
 | `feed_test.cpp` | Sequencing, batching, heartbeats, gaps, retransmission, giving up, and a book rebuilt across a real socket |
 | `full_stack_test.cpp` | Shard, gateway and publisher threads together, with clients on TCP and a subscriber on UDP |
 | `journal_thread_test.cpp` | Shard on one thread and recorder on another: every command reaches the file, in order |
@@ -114,7 +114,7 @@ checks that their figures add up.
 | `reference_book.hpp` | `ReferenceBook`, the slow and obviously correct order book |
 | `feed_auditor.hpp` | `FeedAuditor`, and `RandomFlow`, which produces plausible and implausible commands, sessions closing among them |
 | `shard_harness.hpp` | `small_shard()`, `new_order()`, `cancel_order()`, `session_closed()`, and `as<T>()` to decode what a shard emitted |
-| `wire_client.hpp` | `WireClient`, a minimal order entry client over TCP that never blocks. It sends no heartbeats, so tests that want a timeout say so. |
+| `wire_client.hpp` | `WireClient`, a minimal order entry client over TCP that never blocks. It sends no heartbeats, so tests that want a timeout say so. It counts reports as the protocol tells a client to: `resume()` logs in asking for missed ones, `next_report()` is the count. |
 | `fixtures.hpp` | `TradeLog`, and `scaled()` for `PLANCK_TEST_SCALE` |
 | `temp_dir.hpp` | `TempDir`, a directory removed when the test ends |
 
@@ -126,7 +126,7 @@ at a time in a private copy of the repository, rebuilds, and confirms that
 a test fails.
 
 ```bash
-tools/seeded_bugs.py                # all 95, about 40 minutes on two CPUs
+tools/seeded_bugs.py                # all 132, about 55 minutes on two CPUs
 tools/seeded_bugs.py --only capi    # the ones whose label matches
 tools/seeded_bugs.py --list
 ```
@@ -136,16 +136,22 @@ means a test is missing. This has found real holes every time it has been
 run: seven of the 41 bugs first planted in `capi/` and `bench/` survived
 until tests were added.
 
+**Run all of it after a change of any size, not only the entries near the
+change.** A change in one place can make a test somewhere else unable to
+fail. Cancel on disconnect did that to a check in the bench smoke test,
+and it went unnoticed for two steps because only the nearby bugs were
+rerun (F-31).
+
 **Add a catalogue entry whenever you fix a bug or write a line that would
 be easy to get subtly wrong.** The entry is the change that would bring
 the bug back. `tools_selftest` checks on every test run that each entry's
 pattern still occurs exactly once in the source, so the catalogue cannot
 silently rot.
 
-The catalogue is lopsided: 39 of its 95 entries are in `capi/` and `bench/`,
+The catalogue is lopsided: 39 of its 132 entries are in `capi/` and `bench/`,
 12 are from the session work in `gateway/`, 24 are for cancel on disconnect
-and 15 for heartbeats and silence (W-51). Backfilling the
-older modules is open work.
+15 for heartbeats and silence and 37 for report recovery and repeated
+orders (W-51). Backfilling the older modules is open work.
 
 ## What is expected of new code
 

@@ -67,6 +67,11 @@ constexpr char kUsage[] =
     "                             for this long, and cancel its orders. 0 never\n"
     "                             does, and needs --heartbeat 0 as well.\n"
     "                             Otherwise longer than --heartbeat.       (5000)\n"
+    "  --retain-reports N         hold each client's latest N reports, so that one\n"
+    "                             that lost its connection can ask for those it\n"
+    "                             missed. A power of two. 0 holds none.     (1024)\n"
+    "  --retain-sessions N        how many clients can have reports held: the first\n"
+    "                             N to be sent one. 48 bytes for each report. (256)\n"
     "  --journal-sync MS          longest a command may wait to reach the disk. 0 forces\n"
     "                             the disk after every write  (10)\n"
     "  --cpus LIST                pin threads, e.g. 2-5. Shards take the first CPUs,\n"
@@ -102,6 +107,8 @@ struct Options {
     std::uint32_t journal_sync_ms = 10;
     std::uint32_t heartbeat_ms = 1000;
     std::uint32_t idle_timeout_ms = 5000;
+    std::uint32_t retain_reports = 1024;
+    std::uint32_t retain_sessions = 256;
     // Empty means anyone may log in.
     std::string_view clients{};
     // One CPU per thread when pinning: shards, then gateway, publisher and
@@ -139,6 +146,9 @@ struct ShardRuntime {
     Lifecycle recovery;
     // Valid once recovery is Running.
     journal::ReplayResult replayed{};
+    // By session id, the highest client order id in this shard's journal.
+    // Written by the shard's thread before recovery reaches Running.
+    std::array<std::uint64_t, gateway::Gateway::kMaxSessionId + 1> order_ids{};
     std::thread thread;
     Counter commands, accepted, rejected, trades, cancels, cancel_rejects, stalls, resting,
         disconnect_cancels;
@@ -164,8 +174,9 @@ struct GatewayRuntime {
     // Valid once state is Running.
     net::Endpoint endpoint{};
     Counter sessions, connections, logins, messages_in, rejected, busy, reports_out,
-        reports_dropped, protocol_errors, slow_consumers, bad_credentials, session_closes,
-        heartbeats_out, idle_timeouts, login_timeouts;
+        reports_unsent, protocol_errors, slow_consumers, bad_credentials, session_closes,
+        heartbeats_out, idle_timeouts, login_timeouts, reports_recovered, recoveries,
+        recovery_gaps, duplicate_orders;
 
     // Time from a request coming off the socket to its report being picked
     // up to send, in counter ticks. Only the gateway thread touches it.
@@ -200,7 +211,11 @@ struct GatewayRuntime {
         rejected.set(s.rejected);
         busy.set(s.busy);
         reports_out.set(s.reports_out);
-        reports_dropped.set(s.reports_dropped);
+        reports_unsent.set(s.reports_unsent);
+        reports_recovered.set(s.reports_recovered);
+        recoveries.set(s.recoveries);
+        recovery_gaps.set(s.recovery_gaps);
+        duplicate_orders.set(s.duplicate_orders);
         protocol_errors.set(s.protocol_errors);
         slow_consumers.set(s.slow_consumers);
         bad_credentials.set(s.bad_credentials);
@@ -256,6 +271,9 @@ struct Venue {
     JournalRuntime journal;
     // Written by each shard's thread before its life reaches Running.
     std::array<std::uint64_t, core::kMaxShards> fingerprints{};
+    // By session id, the highest client order id in any journal. Put
+    // together by the gateway's thread from what each shard found.
+    std::array<std::uint64_t, gateway::Gateway::kMaxSessionId + 1> order_ids{};
     // Set by main once the publisher is up and can take replayed market data.
     std::atomic<bool> replay_go{false};
 
@@ -351,7 +369,10 @@ void shard_main(Venue& venue, const Options& options, std::size_t index,
         if (ok(status)) {
             status = journal::replay(path.c_str(), runtime.shard, venue.fingerprints[index],
                                      runtime.replayed,
-                                     [&options]() noexcept { idle_once(options.idle); });
+                                     [&options]() noexcept { idle_once(options.idle); },
+                                     [&runtime](const engine::Command& command) noexcept {
+                                         journal::note_order_id(command, runtime.order_ids);
+                                     });
         }
         if (!ok(status)) {
             fail(runtime.recovery, status);
@@ -370,6 +391,19 @@ void gateway_main(Venue& venue, const Options& options) noexcept {
     config.credentials = options.restricted() ? &venue.credentials : nullptr;
     config.heartbeat_interval_ms = options.heartbeat_ms;
     config.idle_timeout_ms = options.idle_timeout_ms;
+    config.retain_reports = options.retain_reports;
+    config.retain_sessions = options.retain_sessions;
+    // Every shard has finished with its journal by now. An order id is used
+    // if any of them has seen it.
+    for (std::uint32_t shard = 0; shard < options.shards; ++shard) {
+        const auto& found = venue.shards[shard].order_ids;
+        for (std::size_t session = 0; session < found.size(); ++session) {
+            if (found[session] > venue.order_ids[session]) {
+                venue.order_ids[session] = found[session];
+            }
+        }
+    }
+    config.last_order_ids = venue.order_ids;
     config.latency = &runtime.latency;
     config.shards = std::span<engine::Shard* const>{venue.shard_pointers.data(), options.shards};
     config.routes = std::span<const gateway::Route>{venue.routes.data(), options.symbols};
@@ -479,9 +513,10 @@ void print_stats(const Venue& venue, std::uint32_t shards) noexcept {
                 static_cast<unsigned long long>(disconnect_cancels),
                 static_cast<unsigned long long>(resting), static_cast<unsigned long long>(stalls));
     std::printf("stats gateway sessions=%llu connections=%llu logins=%llu messages=%llu "
-                "rejected=%llu busy=%llu reports=%llu dropped=%llu protocol_errors=%llu "
+                "rejected=%llu busy=%llu reports=%llu unsent=%llu protocol_errors=%llu "
                 "slow_consumers=%llu bad_credentials=%llu session_closes=%llu heartbeats=%llu "
-                "idle_timeouts=%llu login_timeouts=%llu\n",
+                "idle_timeouts=%llu login_timeouts=%llu recovered=%llu recoveries=%llu "
+                "recovery_gaps=%llu duplicate_orders=%llu\n",
                 static_cast<unsigned long long>(g.sessions.get()),
                 static_cast<unsigned long long>(g.connections.get()),
                 static_cast<unsigned long long>(g.logins.get()),
@@ -489,14 +524,18 @@ void print_stats(const Venue& venue, std::uint32_t shards) noexcept {
                 static_cast<unsigned long long>(g.rejected.get()),
                 static_cast<unsigned long long>(g.busy.get()),
                 static_cast<unsigned long long>(g.reports_out.get()),
-                static_cast<unsigned long long>(g.reports_dropped.get()),
+                static_cast<unsigned long long>(g.reports_unsent.get()),
                 static_cast<unsigned long long>(g.protocol_errors.get()),
                 static_cast<unsigned long long>(g.slow_consumers.get()),
                 static_cast<unsigned long long>(g.bad_credentials.get()),
                 static_cast<unsigned long long>(g.session_closes.get()),
                 static_cast<unsigned long long>(g.heartbeats_out.get()),
                 static_cast<unsigned long long>(g.idle_timeouts.get()),
-                static_cast<unsigned long long>(g.login_timeouts.get()));
+                static_cast<unsigned long long>(g.login_timeouts.get()),
+                static_cast<unsigned long long>(g.reports_recovered.get()),
+                static_cast<unsigned long long>(g.recoveries.get()),
+                static_cast<unsigned long long>(g.recovery_gaps.get()),
+                static_cast<unsigned long long>(g.duplicate_orders.get()));
     std::printf("stats feed messages=%llu datagrams=%llu heartbeats=%llu send_failures=%llu "
                 "retransmit_requests=%llu retransmitted=%llu refused=%llu\n",
                 static_cast<unsigned long long>(p.messages.get()),
@@ -533,8 +572,21 @@ void print_stats(const Venue& venue, std::uint32_t shards) noexcept {
         !args.text("--journal", options.journal) || !args.text("--clients", options.clients) ||
         !args.number<std::uint32_t>("--journal-sync", options.journal_sync_ms, 0, 60'000) ||
         !args.number<std::uint32_t>("--heartbeat", options.heartbeat_ms, 0, 60'000) ||
-        !args.number<std::uint32_t>("--idle-timeout", options.idle_timeout_ms, 0, 60'000)) {
+        !args.number<std::uint32_t>("--idle-timeout", options.idle_timeout_ms, 0, 60'000) ||
+        !args.number<std::uint32_t>("--retain-reports", options.retain_reports, 0, 1U << 20) ||
+        !args.number<std::uint32_t>("--retain-sessions", options.retain_sessions, 1, 0xFFFF)) {
         return false;
+    }
+    if ((options.retain_reports & (options.retain_reports - 1)) != 0 ||
+        std::uint64_t{options.retain_reports} * options.retain_sessions >
+            gateway::Gateway::kMaxRetainedReports) {
+        std::fprintf(stderr, "planckd: --retain-reports must be a power of two, and times "
+                             "--retain-sessions at most %llu\n",
+                     static_cast<unsigned long long>(gateway::Gateway::kMaxRetainedReports));
+        return false;
+    }
+    if (options.retain_reports == 0) {
+        options.retain_sessions = 0;
     }
     if (options.idle_timeout_ms != 0 &&
         (options.heartbeat_ms == 0 || options.idle_timeout_ms <= options.heartbeat_ms)) {
@@ -762,6 +814,14 @@ void print_banner(const Venue& venue, const Options& options) noexcept {
                     options.idle_timeout_ms);
     } else {
         std::printf("clients: a dead line is never noticed (--idle-timeout 0)\n");
+    }
+    if (options.retain_reports != 0) {
+        std::printf("clients: the last %u reports of each are held for it to ask for again, "
+                    "for the first %u clients (epoch %llu)\n",
+                    options.retain_reports, options.retain_sessions,
+                    static_cast<unsigned long long>(venue.gateway.gateway.epoch()));
+    } else {
+        std::printf("clients: no reports are held: one missed is gone (--retain-reports 0)\n");
     }
     std::printf("retransmit requests on %s\n",
                 apps::format_endpoint(venue.publisher.endpoint).c_str());

@@ -279,5 +279,23 @@ TEST(Framing, RandomBytesNeverCrashAndNeverYieldABadFrame) {
     EXPECT_GT(accepted, 0U) << "the fuzzer never produced a valid frame, so it tested nothing";
 }
 
+TEST(WireReports, OnlyWhatASessionIsToldOfItsOrdersIsNumbered) {
+    // A client counts these to know which report is which. Counting one too
+    // many or one too few puts every later number out.
+    int numbered = 0;
+    for (int type = 0; type < 256; ++type) {
+        numbered += is_report(static_cast<MsgType>(type)) ? 1 : 0;
+    }
+    EXPECT_EQ(numbered, 5);
+    EXPECT_TRUE(is_report(MsgType::OrderAccepted));
+    EXPECT_TRUE(is_report(MsgType::OrderRejected));
+    EXPECT_TRUE(is_report(MsgType::Executed));
+    EXPECT_TRUE(is_report(MsgType::Canceled));
+    EXPECT_TRUE(is_report(MsgType::CancelRejected));
+    EXPECT_FALSE(is_report(MsgType::LoginAccepted));
+    EXPECT_FALSE(is_report(MsgType::Heartbeat));
+    EXPECT_FALSE(is_report(MsgType::MdExecuted));
+}
+
 }  // namespace
 }  // namespace planck::wire

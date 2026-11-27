@@ -40,6 +40,11 @@ constexpr char kUsage[] =
     "  --client-id N           who to log in as, 1 to 65535  (1)\n"
     "  --token N               the secret the venue holds for that client id, if it\n"
     "                          was started with --clients    (0)\n"
+    "  --next-report N         ask for the reports this client id was sent before,\n"
+    "                          from number N on: 1 for all the venue still holds.\n"
+    "                          0 asks for none               (0)\n"
+    "  --epoch N               the run of the venue that N was counted in, as\n"
+    "                          printed when an earlier planck-client left (0)\n"
     "  --linger MS             after the input ends, keep listening until the venue\n"
     "                          has been quiet this long      (200)\n"
     "\n"
@@ -66,7 +71,7 @@ constexpr std::uint64_t kAnswerTimeoutNs = 5'000 * kNanosPerMilli;
 enum ExitCode : int { kOk = 0, kFailed = 1, kBadUsage = 2 };
 
 // What the client is waiting for before it will read another command.
-enum class Awaiting : std::uint8_t { Nothing, Login, OrderAnswer, CancelAnswer };
+enum class Awaiting : std::uint8_t { Nothing, Login, Recovery, OrderAnswer, CancelAnswer };
 
 std::string_view text_of(wire::LoginRejectReason reason) noexcept {
     switch (reason) {
@@ -78,6 +83,8 @@ std::string_view text_of(wire::LoginRejectReason reason) noexcept {
             return "UnsupportedVersion";
         case wire::LoginRejectReason::ServerFull:
             return "ServerFull";
+        case wire::LoginRejectReason::BadSequence:
+            return "BadSequence";
     }
     return "Unknown";
 }
@@ -96,8 +103,13 @@ std::string_view text_of(wire::CancelReason reason) noexcept {
 
 class Client {
 public:
-    Client(std::uint32_t client_id, std::uint64_t token, std::uint64_t linger_ms) noexcept
-        : client_id_(client_id), token_(token), linger_ns_(linger_ms * kNanosPerMilli) {}
+    Client(std::uint32_t client_id, std::uint64_t token, std::uint64_t linger_ms,
+           std::uint64_t epoch, std::uint64_t next_report) noexcept
+        : client_id_(client_id),
+          token_(token),
+          linger_ns_(linger_ms * kNanosPerMilli),
+          epoch_(epoch),
+          next_report_(next_report) {}
 
     [[nodiscard]] int run(net::Endpoint server, const std::atomic<bool>& stop) noexcept;
 
@@ -113,6 +125,7 @@ private:
     // connection is gone or the venue sent something that is not the protocol.
     [[nodiscard]] bool receive() noexcept;
     void print(const wire::Frame& frame) noexcept;
+    void logged_in(const wire::LoginAccepted& accepted) noexcept;
     void answered(Awaiting what) noexcept;
 
     // Read from standard input into the line buffer.
@@ -129,6 +142,13 @@ private:
     std::uint32_t client_id_;
     std::uint64_t token_;
     std::uint64_t linger_ns_;
+    // Which run of the venue the reports are being counted in, the number
+    // of the next one, and the number of the first that will be new. Before
+    // login the first two are what the user asked to resume from.
+    std::uint64_t epoch_;
+    std::uint64_t next_report_;
+    std::uint64_t live_from_ = 0;
+    bool logged_in_ = false;
     Awaiting awaiting_ = Awaiting::Nothing;
     std::uint64_t sent_at_ = 0;        // when the request being awaited went out
     std::uint64_t last_activity_ = 0;  // last send or receive, heartbeats aside
@@ -189,15 +209,51 @@ void Client::answered(Awaiting what) noexcept {
     }
 }
 
+void Client::logged_in(const wire::LoginAccepted& accepted) noexcept {
+    const auto u64 = [](std::uint64_t v) { return static_cast<unsigned long long>(v); };
+    std::printf("logged in client_id=%u session=%u\n", client_id_, accepted.session_id);
+    if (next_report_ != 0 && epoch_ != 0 && epoch_ != accepted.epoch) {
+        std::printf("the venue has restarted since epoch %llu: its report numbers start again, "
+                    "and whatever this client had resting was cancelled\n",
+                    u64(epoch_));
+    } else if (next_report_ != 0 && accepted.next_report > next_report_) {
+        std::printf("reports %llu to %llu are no longer held by the venue\n", u64(next_report_),
+                    u64(accepted.next_report - 1));
+    }
+    epoch_ = accepted.epoch;
+    next_report_ = accepted.next_report;
+    live_from_ = accepted.live_from;
+    logged_in_ = true;
+    venue_timeout_ns_ = std::uint64_t{accepted.idle_timeout_ms} * kNanosPerMilli;
+    // Carry on above whatever this client id has used before, or the venue
+    // would take the new orders for repeats.
+    next_client_order_id_ = accepted.last_client_order_id + 1;
+    if (awaiting_ != Awaiting::Login) {
+        return;
+    }
+    awaiting_ = Awaiting::Nothing;
+    if (live_from_ > next_report_) {
+        std::printf("recovering reports %llu to %llu\n", u64(next_report_), u64(live_from_ - 1));
+        awaiting_ = Awaiting::Recovery;
+    }
+}
+
 void Client::print(const wire::Frame& frame) noexcept {
     const auto u64 = [](std::uint64_t v) { return static_cast<unsigned long long>(v); };
+    if (logged_in_ && wire::is_report(frame.type)) {
+        // The venue numbers these, and counting them is how to know which
+        // is which. The ones below live_from_ are from before this login.
+        if (next_report_ < live_from_) {
+            std::printf("earlier #%llu: ", u64(next_report_));
+            sent_at_ = now();
+        }
+        ++next_report_;
+    }
     switch (frame.type) {
         case wire::MsgType::LoginAccepted: {
             wire::LoginAccepted m;
             if (ok(wire::decode(frame.bytes, m))) {
-                std::printf("logged in client_id=%u session=%u\n", client_id_, m.session_id);
-                venue_timeout_ns_ = std::uint64_t{m.idle_timeout_ms} * kNanosPerMilli;
-                awaiting_ = (awaiting_ == Awaiting::Login) ? Awaiting::Nothing : awaiting_;
+                logged_in(m);
             }
             break;
         }
@@ -307,6 +363,10 @@ bool Client::receive() noexcept {
             last_activity_ = last_heard_;
         }
         print(frame);
+        if (awaiting_ == Awaiting::Recovery && next_report_ >= live_from_) {
+            std::printf("caught up\n");
+            awaiting_ = Awaiting::Nothing;
+        }
         offset += frame.bytes.size();
     }
     rx_length_ -= offset;
@@ -478,6 +538,8 @@ int Client::run(net::Endpoint server, const std::atomic<bool>& stop) noexcept {
     wire::LoginRequest login{};
     login.client_id = client_id_;
     login.token = token_;
+    login.epoch = epoch_;
+    login.next_report = next_report_;
     if (!send(login, Awaiting::Login)) {
         return kFailed;
     }
@@ -529,6 +591,12 @@ int Client::run(net::Endpoint server, const std::atomic<bool>& stop) noexcept {
     if (failed_) {
         return kFailed;
     }
+    if (logged_in_) {
+        // What to start the next one with to miss nothing.
+        std::printf("left at --epoch %llu --next-report %llu\n",
+                    static_cast<unsigned long long>(epoch_),
+                    static_cast<unsigned long long>(next_report_));
+    }
     // Leave politely. If this fails the venue notices the close anyway.
     static_cast<void>(send(wire::Logout{}, Awaiting::Nothing));
     return kOk;
@@ -549,14 +617,18 @@ int main(int argc, char** argv) {
     std::uint32_t client_id = 1;
     std::uint64_t token = 0;
     std::uint64_t linger_ms = 200;
+    std::uint64_t epoch = 0;
+    std::uint64_t next_report = 0;
     if (!args.endpoint("--connect", server) ||
         !args.number<std::uint32_t>("--client-id", client_id, 1, 0xFFFFU) ||
         !args.number<std::uint64_t>("--token", token, 0, ~std::uint64_t{0}) ||
+        !args.number<std::uint64_t>("--epoch", epoch, 0, ~std::uint64_t{0}) ||
+        !args.number<std::uint64_t>("--next-report", next_report, 0, ~std::uint64_t{0}) ||
         !args.number<std::uint64_t>("--linger", linger_ms, 0, 600'000) || !args.finish()) {
         return kBadUsage;
     }
 
     // Too big for comfort on the stack, and there is only ever one.
-    static Client client(client_id, token, linger_ms);
+    static Client client(client_id, token, linger_ms, epoch, next_report);
     return client.run(server, apps::stop_on_signal());
 }

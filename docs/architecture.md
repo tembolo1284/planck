@@ -280,8 +280,25 @@ One thread that owns every client connection.
   same on every connection and across restarts, and it is what owns orders
   in the shard and in the journal. A connection is one TCP link in one of
   1024 slots. A table maps each session id to the slot of the connection
-  speaking for it, if any. That table is how a report finds its way out,
-  and a report whose session has no connection is dropped and counted.
+  speaking for it, if any. That table is how a report finds its way out.
+- **Numbered reports** (S-33). Every report to a session goes through one
+  function, `deliver()`, whether a shard made it or the gateway did. It
+  gives the report the session's next number, copies it into the session's
+  ring of held reports if the session has one, and queues it for the
+  connection if there is one and it is up to date. The number is not on
+  the wire: the client counts. A connection that asked at login for older
+  reports is "behind": new reports are only held, and each pass sends it as
+  many held ones as its buffer has room for, until it has caught up. So a
+  connection is a cursor into its session's reports, and order is kept by
+  there being one cursor. The rings are one arena block, set aside at
+  startup.
+- **At most once** (S-34). The gateway keeps the highest client order id
+  of each session and ignores a `NewOrder` that is not above it. It is the
+  gateway and not a shard because one session's orders spread over shards
+  and only the gateway sees them in the order they were sent. At startup
+  the table is filled from the journals: `journal::replay()` shows each
+  command to a caller that asks, and `planckd` keeps the highest order id
+  per session.
 - **Disconnects** (S-27). When a connection that had logged in ends, the
   gateway pushes a "session closed" command to every shard, behind whatever
   that session had already sent. If a shard's ring is full the close is
@@ -410,8 +427,12 @@ when the shards stop get no answer (W-61).
 A few open decisions would reach across modules if taken. Know about them
 before designing on top of the current shape.
 
-- **Keeping orders through a disconnect (D-18)** needs report recovery
-  first, so a returning client can learn what happened to them.
+- **Keeping orders through a disconnect (D-18)** has what it needed: a
+  returning client can now learn what happened to its orders. It would
+  still need held reports to survive a restart (W-98).
+- **Held reports that survive a restart (W-98)** need the order in which
+  the gateway interleaved the shards' reports to be recorded somewhere.
+  That is the commit boundary of step 4, not a change to the gateway alone.
 - **A limit on resting orders per session (D-19)** is a check where an
   order comes to rest, and a counter beside each session's list.
 - **Group commit (D-12)** means holding reports until the sync that covers

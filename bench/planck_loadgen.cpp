@@ -331,9 +331,16 @@ void LoadGenerator::handle(Session& session, const wire::Frame& frame, std::uint
     };
 
     switch (frame.type) {
-        case wire::MsgType::LoginAccepted:
+        case wire::MsgType::LoginAccepted: {
+            // Carry on above the ids an earlier run used as this client, or
+            // the venue would take every order for a repeat and ignore it.
+            wire::LoginAccepted accepted;
+            if (ok(wire::decode(frame.bytes, accepted))) {
+                session.next_client_order_id = accepted.last_client_order_id + 1;
+            }
             ++logins_;
             break;
+        }
         case wire::MsgType::OrderAccepted: {
             wire::OrderAccepted accepted;
             static_cast<void>(wire::decode(frame.bytes, accepted));

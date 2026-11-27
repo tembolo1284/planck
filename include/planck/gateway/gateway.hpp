@@ -57,6 +57,26 @@ struct GatewayConfig {
     // so that they need not wait for real time to pass.
     std::uint64_t (*clock)() noexcept = nullptr;
 
+    // How many of each session's latest reports to hold, so that a client
+    // that lost its connection can be sent the ones it missed. A power of
+    // two, or zero to hold none: reports are numbered all the same, and a
+    // client that asks for old ones is told they are gone.
+    std::uint32_t retain_reports = 0;
+    // How many sessions can have reports held. The first that many to be
+    // sent a report get the room, and the rest are treated as if
+    // retain_reports were zero. Both zero or both not. Each held report
+    // costs wire::kMaxMessageSize bytes, set aside at init().
+    std::uint32_t retain_sessions = 0;
+    // Names this run of the venue to clients. Report numbers mean nothing
+    // across two runs, and this is how a client can tell. Zero: the time
+    // now, which is what a venue wants. Tests set it.
+    std::uint64_t epoch = 0;
+    // The highest client order id each session has used, by session id:
+    // empty, or one for every id from 0 to kMaxSessionId. A venue that has
+    // rebuilt itself from a journal passes what it found there, so that an
+    // order sent again after the restart is still known for a repeat.
+    std::span<const std::uint64_t> last_order_ids{};
+
     // Who may log in. If null, any client id from 1 to 65,535 may, and the
     // token is ignored: fine for tests and a closed lab, nowhere else. The
     // table must outlive the gateway and must not change while it runs.
@@ -101,8 +121,17 @@ struct GatewayStats {
     std::uint64_t idle_timeouts = 0;
     // Connections ended because they did not log in soon enough.
     std::uint64_t login_timeouts = 0;
-    // Reports for a session that had no connection at the time.
-    std::uint64_t reports_dropped = 0;
+    // Reports for a session that had no connection at the time. If the
+    // session has room they are held for it.
+    std::uint64_t reports_unsent = 0;
+    // Held reports sent to a client that asked for them when it logged in.
+    std::uint64_t reports_recovered = 0;
+    // Logins that were owed held reports, and logins that asked for reports
+    // no longer held.
+    std::uint64_t recoveries = 0;
+    std::uint64_t recovery_gaps = 0;
+    // Orders ignored because their client order id was not above the last.
+    std::uint64_t duplicate_orders = 0;
     // Connections dropped for sending bytes that are not the protocol.
     std::uint64_t protocol_errors = 0;
     // Connections dropped for not reading their reports fast enough.
@@ -135,8 +164,19 @@ struct GatewayStats {
 // close it cannot log in again, or the late close would cancel the orders
 // of its new connection.
 //
-// A client that reconnects is the same owner as before. Reports produced
-// while it had no connection are dropped and counted.
+// A client that reconnects is the same owner as before. Every report to a
+// session has a number, counted from 1 for as long as this gateway runs,
+// and the latest of them are held. A client says at login which number it
+// expects next and is sent the held ones from there on, in order, before
+// anything new. Reports produced while it had no connection are among
+// them. What a client asks for and is no longer held is gone, and it is
+// told so by where the numbers resume. A client that falls further behind
+// than what is held, while connected, is disconnected as too slow.
+//
+// An order is carried out at most once. The gateway remembers the highest
+// client order id of each session and ignores a NewOrder that is not above
+// it. The id counts as used as soon as the gateway has seen it, whatever
+// became of the order.
 //
 // A line can die without the kernel ever saying so. So, if configured to,
 // the gateway ends any connection it has heard nothing on for too long,
@@ -152,6 +192,8 @@ public:
     static constexpr std::size_t kRxBufferBytes = 4096;
     static constexpr std::uint32_t kMaxSessionId = 0xFFFF;
     static constexpr std::uint32_t kMaxIdleTimeoutMs = 0xFFFF;
+    // Most reports that can be held, over all sessions.
+    static constexpr std::uint64_t kMaxRetainedReports = std::uint64_t{1} << 24;
     // A gap this long between two passes means the gateway itself was held
     // up, and nobody is blamed for the silence.
     static constexpr std::uint64_t kOwnPauseNs = 100'000'000;
@@ -175,6 +217,7 @@ public:
     // Clients connected right now, logged in or not.
     [[nodiscard]] std::uint32_t active_sessions() const noexcept { return active_; }
     [[nodiscard]] const GatewayStats& stats() const noexcept { return stats_; }
+    [[nodiscard]] std::uint64_t epoch() const noexcept { return epoch_; }
 
 private:
     struct Connection {
@@ -184,6 +227,7 @@ private:
         bool open = false;     // false while the slot is free
         bool closing = false;  // goes as soon as what is queued has been sent
         bool dirty = false;    // has bytes waiting in tx
+        bool behind = false;   // still being sent held reports
         std::uint32_t rx_length = 0;
         std::uint32_t tx_length = 0;
         // When it connected, when bytes last arrived on it, and when
@@ -191,6 +235,8 @@ private:
         std::uint64_t opened_ns = 0;
         std::uint64_t heard_ns = 0;
         std::uint64_t sent_ns = 0;
+        // The number of the next report to queue for it.
+        std::uint64_t next_send = 0;
         std::byte* rx = nullptr;
         std::byte* tx = nullptr;
     };
@@ -205,6 +251,7 @@ private:
     static constexpr std::size_t kSessionIds = std::size_t{kMaxSessionId} + 1;
     static constexpr std::uint16_t kNoConnection = 0xFFFF;
     static_assert(kSlots <= kNoConnection);
+    static constexpr std::uint16_t kNoHistory = 0xFFFF;
 
     [[nodiscard]] std::uint16_t slot_of(const Connection& connection) const noexcept {
         return static_cast<std::uint16_t>(&connection - connections_.data());
@@ -220,6 +267,19 @@ private:
     // gone silent and clients that are due a heartbeat.
     void keep_time() noexcept;
     void check_connections() noexcept;
+
+    // Give a session its next report: number it, hold it, and send it now
+    // if its connection is up to date.
+    void deliver(core::SessionId session, std::span<const std::byte> bytes) noexcept;
+    // Where the report with this number is held or is to be held, or
+    // nullptr if the session has no room.
+    [[nodiscard]] std::byte* held(core::SessionId session, std::uint64_t number) noexcept;
+    // The lowest number still held for a session. If nothing is, the number
+    // its next report will have.
+    [[nodiscard]] std::uint64_t oldest_held(core::SessionId session) const noexcept;
+    // Send held reports to the connections that are behind, as far as each
+    // has room for.
+    std::size_t send_held() noexcept;
 
     // Tell every shard that a session has lost its connection.
     void close_session(core::SessionId session) noexcept;
@@ -246,6 +306,8 @@ private:
                       std::uint64_t ingress_tsc) noexcept;
     void on_cancel(Connection& connection, const wire::CancelOrder& cancel,
                    std::uint64_t ingress_tsc) noexcept;
+    // Both go to the session as numbered reports if the connection has
+    // logged in, and straight to the connection if it has not.
     void reject_order(Connection& connection, std::uint64_t client_order_id,
                       wire::RejectCode reason) noexcept;
     void reject_cancel(Connection& connection, std::uint64_t order_id, wire::RejectCode reason) noexcept;
@@ -276,6 +338,15 @@ private:
     std::uint32_t max_sessions_ = 0;
     std::uint32_t tx_capacity_ = 0;
     std::size_t dirty_count_ = 0;
+    // Connections that are still being sent held reports.
+    std::size_t behind_count_ = 0;
+    std::uint64_t epoch_ = 0;
+    // Reports held per session, sessions that can have any, how many do,
+    // and the room itself: one block of retain_reports_ reports for each.
+    std::uint32_t retain_reports_ = 0;
+    std::uint32_t retain_sessions_ = 0;
+    std::uint32_t histories_ = 0;
+    std::byte* history_ = nullptr;
     engine::IdlePolicy idle_ = engine::IdlePolicy::Spin;
     GatewayStats stats_{};
 
@@ -292,6 +363,11 @@ private:
     std::array<std::uint16_t, kSessionIds> owed_sessions_{};
     std::size_t owed_count_ = 0;
     static_assert(core::kMaxShards <= 16);
+    // By session id: the number its next report will have, the highest
+    // client order id it has used, and which block of history_ is its own.
+    std::array<std::uint64_t, kSessionIds> next_report_{};
+    std::array<std::uint64_t, kSessionIds> last_order_id_{};
+    std::array<std::uint16_t, kSessionIds> history_of_{};
     mem::Arena arena_{};
 };
 

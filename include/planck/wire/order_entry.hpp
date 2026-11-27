@@ -19,6 +19,15 @@ namespace planck::wire {
 // answers a Heartbeat. LoginAccepted tells the client how long the venue
 // will put up with hearing nothing from it.
 //
+// The venue numbers the reports it sends a session: OrderAccepted,
+// OrderRejected, Executed, Canceled and CancelRejected, once the session
+// has logged in. The numbers start at 1 and go up by one, across however
+// many connections the session uses. They are not on the wire. TCP loses
+// nothing and reorders nothing within a connection, so LoginAccepted says
+// what number the next report has and the client counts from there. A
+// client that reconnects says what number it expects next, and is sent
+// what it missed before anything new. See LoginRequest and LoginAccepted.
+//
 // Each struct's default value already has a correct header, so
 //     NewOrder order{};
 // is ready to fill in and send.
@@ -33,6 +42,15 @@ struct LoginRequest {
     std::uint32_t client_id = 0;
     std::uint32_t reserved2 = 0;
     std::uint64_t token = 0;
+    // Which run of the venue next_report was counted in: the epoch from the
+    // LoginAccepted of an earlier connection. Zero if there was none.
+    std::uint64_t epoch = 0;
+    // The number of the first report the client has not seen. Zero: it wants
+    // nothing from before, only what is new. 1: everything the venue still
+    // holds. If the epoch is not the venue's own the venue has restarted and
+    // the number means nothing to it: the client is then sent everything
+    // held, as for 1.
+    std::uint64_t next_report = 0;
 };
 
 struct LoginAccepted {
@@ -43,6 +61,17 @@ struct LoginAccepted {
     // milliseconds. Zero means it never does. A client should send something,
     // a Heartbeat if nothing else, about three times as often.
     std::uint16_t idle_timeout_ms = 0;
+    // This run of the venue. Report numbers start again at 1 when it changes.
+    std::uint64_t epoch = 0;
+    // The number of the first report this connection will carry. Above what
+    // was asked for means the reports in between are no longer held.
+    std::uint64_t next_report = 0;
+    // The number the first new report will have. Those from next_report up
+    // to here are ones from before, sent again or sent late.
+    std::uint64_t live_from = 0;
+    // The highest client order id the venue has had from this session. A
+    // NewOrder whose id is not above it is taken for a repeat and ignored.
+    std::uint64_t last_client_order_id = 0;
 };
 
 struct LoginRejected {
@@ -73,7 +102,10 @@ struct NewOrder {
     std::uint16_t symbol_id = 0;
     std::uint8_t side = 0;
     std::uint8_t order_type = 0;
-    // Chosen by the client and echoed back. The venue does not interpret it.
+    // Chosen by the client and echoed back. It must be above every id the
+    // session has sent before, on any connection: an order whose id is not
+    // is taken for a repeat of one the venue already has, and is ignored
+    // without an answer. That makes sending an order again safe.
     std::uint64_t client_order_id = 0;
     // Ticks. Ignored for market orders.
     std::int32_t price = 0;
@@ -151,9 +183,13 @@ struct CancelRejected {
 
 // The layout is the protocol. These pin it down so an accidental change to a
 // struct fails the build instead of silently breaking every client.
-static_assert(Message<LoginRequest> && sizeof(LoginRequest) == 24);
+static_assert(Message<LoginRequest> && sizeof(LoginRequest) == 40);
 static_assert(offsetof(LoginRequest, client_id) == 8 && offsetof(LoginRequest, token) == 16);
-static_assert(Message<LoginAccepted> && sizeof(LoginAccepted) == 8);
+static_assert(offsetof(LoginRequest, epoch) == 24 && offsetof(LoginRequest, next_report) == 32);
+static_assert(Message<LoginAccepted> && sizeof(LoginAccepted) == 40);
+static_assert(offsetof(LoginAccepted, epoch) == 8 && offsetof(LoginAccepted, next_report) == 16);
+static_assert(offsetof(LoginAccepted, live_from) == 24);
+static_assert(offsetof(LoginAccepted, last_client_order_id) == 32);
 static_assert(Message<LoginRejected> && sizeof(LoginRejected) == 8);
 static_assert(Message<Heartbeat> && sizeof(Heartbeat) == 4);
 static_assert(Message<Logout> && sizeof(Logout) == 4);

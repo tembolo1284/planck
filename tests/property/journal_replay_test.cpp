@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -46,6 +48,10 @@ struct Session {
     // asked for. That only works in a first life: after a restart, fills
     // arrive for orders that were sent before the auditor existed.
     bool audit_reports = true;
+    // What replay showed of the commands: how many, and by session id the
+    // highest client order id among them.
+    std::uint64_t commands_shown = 0;
+    std::vector<std::uint64_t> order_ids = std::vector<std::uint64_t>(65'536);
 
     // Start a shard and bring it up to date from whatever journal is there.
     Status start(const std::string& directory, const engine::ShardConfig& config,
@@ -59,7 +65,11 @@ struct Session {
         }
         fingerprints[0] = fingerprint(config);
         const Status status = replay(path.c_str(), *shard, fingerprints[0], replayed,
-                                     [this]() noexcept { collect(); });
+                                     [this]() noexcept { collect(); },
+                                     [this](const engine::Command& command) noexcept {
+                                         ++commands_shown;
+                                         note_order_id(command, order_ids);
+                                     });
         if (status != Status::Ok) {
             return status;
         }
@@ -328,6 +338,45 @@ TEST_F(JournalRecovery, ReportsTheHighestSessionSeen) {
     ASSERT_EQ(again.start(dir_.path(), journaling_shard()), Status::Ok);
     EXPECT_EQ(again.replayed.records, 3U);
     EXPECT_EQ(again.replayed.max_session, 311);
+}
+
+TEST_F(JournalRecovery, ReplayShowsTheHighestOrderIdOfEachSession) {
+    Session run;
+    ASSERT_EQ(run.start(dir_.path(), journaling_shard()), Status::Ok);
+    run.audit_reports = false;  // these orders are pushed by hand, not through the flow
+    EXPECT_EQ(run.commands_shown, 0U);
+    const auto push = [&run](const engine::Command& command) {
+        ASSERT_TRUE(run.shard->commands().try_push(command));
+    };
+    push(test::new_order(4, 3, core::Side::Buy, 950, 1, 9));
+    push(test::new_order(4, 3, core::Side::Buy, 950, 1, 3));  // lower, and later
+    push(test::new_order(311, 3, core::Side::Buy, 950, 1, 12));
+    push(test::new_order(65'535, 3, core::Side::Buy, 950, 1, 2));
+    // A cancel's id is an order id of the venue's, and no client order id.
+    wire::CancelOrder cancel{};
+    cancel.order_id = ~std::uint64_t{0};
+    push(engine::make_command(cancel, core::SessionId{17}, 0));
+    push(test::session_closed(4));
+    run.stop();
+
+    Session again;
+    ASSERT_EQ(again.start(dir_.path(), journaling_shard()), Status::Ok);
+    EXPECT_EQ(again.replayed.records, 6U);
+    EXPECT_EQ(again.commands_shown, 6U);
+    EXPECT_EQ(again.order_ids[4], 9U);
+    EXPECT_EQ(again.order_ids[311], 12U);
+    EXPECT_EQ(again.order_ids[65'535], 2U);
+    EXPECT_EQ(again.order_ids[17], 0U) << "a cancel was taken for an order";
+    EXPECT_EQ(std::count(again.order_ids.begin(), again.order_ids.end(), 0U), 65'533);
+
+    // A table that does not reach a session is left alone, not overrun:
+    // here the table is the first eight of nine.
+    std::array<std::uint64_t, 9> room{};
+    const std::span<std::uint64_t> small = std::span{room}.first(8);
+    note_order_id(test::new_order(8, 3, core::Side::Buy, 950, 1, 5), small);
+    note_order_id(test::new_order(7, 3, core::Side::Buy, 950, 1, 5), small);
+    EXPECT_EQ(room[7], 5U);
+    EXPECT_EQ(room[8], 0U) << "written past the end of the table";
 }
 
 TEST_F(JournalRecovery, SyncsAsOftenAsItWasToldTo) {

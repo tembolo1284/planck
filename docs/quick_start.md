@@ -29,7 +29,7 @@ sudo apt install g++ clang cmake ninja-build python3 python3-cffi
 ./build.sh test --checked
 ```
 
-This configures `build/gcc-checked/`, builds everything and runs 332 tests.
+This configures `build/gcc-checked/`, builds everything and runs 354 tests.
 It should end with `100% tests passed`. "checked" is an optimised build with
 every contract tested at run time, which is the right one for tests.
 
@@ -84,6 +84,12 @@ cancel ORDER_ID | cancel last
 The client sends heartbeats by itself while you think. A client that goes
 silent for five seconds is taken for dead and its orders are cancelled.
 
+When a client leaves it prints where it got to, for example
+`left at --epoch 1795800218734426517 --next-report 3`. Start it again with
+those two options and the venue first sends whatever that client was sent
+since: here the `Canceled` for the order it left behind. `--next-report 1`
+alone asks for everything the venue still holds for the client.
+
 To watch the public feed, in a fourth terminal:
 
 ```bash
@@ -137,7 +143,7 @@ C program needs. `capi/tests/capi_smoke.c` is a complete example, and
 | `build/ holds an old build made without presets` | An older checkout built straight into `build/`. Run `rm -rf build`. |
 | `ninja is not installed or not on PATH` | Install Ninja. The presets use it. |
 | Configure hangs or fails fetching GoogleTest | No network. Install `libgtest-dev`, version 1.14 or later. |
-| 331 tests, not 332 | Python's `cffi` is not installed. Harmless. |
+| 353 tests, not 354 | Python's `cffi` is not installed. Harmless. |
 | `FeedMulticast` reported as skipped | This host does not route multicast. Harmless. |
 | `clang-asan` or `clang-tsan` fails to link | Clang's sanitizer runtime is missing. Install `libclang-rt-dev`. |
 | A test fails only when the machine is busy | Tell us. Several such bugs were real (F-04 to F-06 in weaknesses.md). |

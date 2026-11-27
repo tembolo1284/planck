@@ -22,7 +22,7 @@ on real hardware yet, and several product decisions are still open. Read
 | Compilers | GCC 13 or later, Clang 18 or later |
 | Platform | Linux on x86-64. AArch64 paths exist and are untested. |
 | Build | CMake 3.25 or later with Ninja, driven by `./build.sh` |
-| Tests | 332, in ten build configurations |
+| Tests | 354, in ten build configurations |
 | Size | about 7,700 lines of library, 7,900 of tests |
 
 ## Quick start
@@ -120,6 +120,10 @@ next, and in what order, is the "Agreed plan" at the top of
   orders are cancelled when its connection ends, and every order is
   cancelled when the venue starts (S-27, S-28). A line that dies without
   closing is noticed by its silence, after five seconds by default (S-31).
+- **A client that reconnects can ask for the reports it missed,** and an
+  order sent twice is carried out once (S-33, S-34). The reports are held
+  in memory: the last 1024 for each client, and none across a restart of
+  the venue (W-98, W-99).
 - **The login token is sent in the clear.** `planckd --clients` says who may
   log in, and order entry must run over a private link (S-23, W-08).
 - **The feed has no snapshots.** A subscriber that falls too far behind

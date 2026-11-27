@@ -23,6 +23,8 @@ planckd [options]
 | `--clients FILE` | off | Who may log in. Without it anyone may, as any client id. See "Clients" below. |
 | `--heartbeat MS` | 1000 | Send a heartbeat to a client that has been sent nothing for this long. 0 never does. |
 | `--idle-timeout MS` | 5000 | End a connection nothing has been heard on for this long, and cancel its orders. Longer than `--heartbeat`. 0 never does, and is the only value allowed with `--heartbeat 0`. |
+| `--retain-reports N` | 1024 | Hold each client's latest N reports in memory, so that one that lost its connection can ask for those it missed. A power of two. 0 holds none. |
+| `--retain-sessions N` | 256 | How many clients can have reports held: the first N to be sent one. 48 bytes for each held report, so 12 MB with the defaults. |
 | `--journal DIRECTORY` | off | Record every command, and rebuild from it at startup |
 | `--journal-sync MS` | 10 | Longest a command may wait to reach the disk. 0 syncs after every write. |
 | `--cpus LIST` | none | Pin threads, for example `2-5` or `2,4,6,8` |
@@ -44,6 +46,7 @@ feed stream 1 -> 127.0.0.1:30002
 order entry on 0.0.0.0:9000
 clients: 12 listed in /etc/planck/clients
 clients: one heard nothing from for 5000 ms is disconnected
+clients: the last 1024 reports of each are held for it to ask for again, for the first 256 clients (epoch 1795800218734426517)
 retransmit requests on 0.0.0.0:30000
 journal in /var/planck, synced within 10 ms
 shard 0 replayed 18234 commands
@@ -105,7 +108,8 @@ A venue never leaves a client's orders working behind its back (S-27).
   can connect (S-28). With a journal the books are rebuilt first and then
   emptied, so the feed shows that too.
 - A client that reconnects is the same session and starts with nothing
-  resting. It is not told what happened while it was away (W-04).
+  resting. It can ask for the reports it missed while it was away: see
+  "Reports a client missed" below.
 
 There is no flag for this. A connection ends in one of three ways:
 
@@ -129,6 +133,37 @@ One limit to know:
 - All of a client's orders are cancelled in one go, and the shard does
   nothing else meanwhile. A client with hundreds of thousands of orders
   resting makes everyone on its shards wait when it leaves (W-25).
+
+
+### Reports a client missed
+
+Every report to a client has a number, and the venue holds the latest
+`--retain-reports` of them for each client, in memory. A client that
+connects again says which number it expects next and is sent the rest
+before anything new. [protocol.md](protocol.md) has the rules a client
+must follow. What an operator needs to know:
+
+- **It is sized at startup.** `--retain-sessions` blocks of
+  `--retain-reports` reports, 48 bytes each, are set aside when the venue
+  starts. The first clients to be sent a report get a block each and keep
+  it. Later ones get none: they trade as usual, but a report they miss is
+  gone (W-99). With a clients file, set `--retain-sessions` to at least the
+  number of clients in it.
+- **It does not survive a restart.** The epoch in the startup banner names
+  this run. After a restart clients see a new one and their numbers start
+  again (W-98).
+- **A client that never comes back costs nothing more.** Its block is
+  overwritten in place.
+- **`planck-client`** prints `left at --epoch E --next-report N` when it
+  leaves. Given those two options the next time, it asks for what it
+  missed and prints each such report with `earlier #N:` in front.
+  `--next-report 1` alone asks for everything held.
+
+Orders are protected the same way in the other direction. A client's order
+ids must go up, and an order whose id does not is ignored, so a client that
+is unsure whether an order arrived can simply send it again (S-34). The
+venue learns the highest id each client has used from its journal at
+startup, so this holds across a restart too, for a venue with `--journal`.
 
 ### Threads and CPUs
 
@@ -165,8 +200,9 @@ None of this has been exercised in development (W-43, W-49).
 stats engine  commands accepted rejected trades cancels disconnect_cancels
               resting stalls
 stats gateway sessions connections logins messages rejected busy reports
-              dropped protocol_errors slow_consumers bad_credentials
+              unsent protocol_errors slow_consumers bad_credentials
               session_closes heartbeats idle_timeouts login_timeouts
+              recovered recoveries recovery_gaps duplicate_orders
 stats feed    messages datagrams heartbeats send_failures retransmit_requests
               retransmitted refused
 stats latency reports p50_ns p99_ns p999_ns max_ns
@@ -181,7 +217,10 @@ What to watch:
 | `gateway busy` | Orders were rejected because a command ring was full. The shard is the bottleneck. |
 | `engine disconnect_cancels` | Orders cancelled because their client's connection ended, or the venue started. Not included in `cancels`. |
 | `engine commands` | Counts sessions closing as well as orders and cancels. One per shard for each client that leaves, and one per shard at each start. |
-| `gateway dropped` | Reports for clients that had no connection at the time. Each order cancelled by a disconnect adds one. |
+| `gateway unsent` | Reports for clients that had no connection at the time. Each order cancelled by a disconnect adds one. They are held for the client to ask for, if it is one of the clients with room. |
+| `gateway recovered` | Held reports sent to clients that asked for them at login. `recoveries` counts the logins that were owed any. |
+| `gateway recovery_gaps` | Logins that asked for reports the venue no longer held. Each is a client that has lost part of its history. If this climbs, raise `--retain-reports`. |
+| `gateway duplicate_orders` | Orders ignored because their client order id was not above the client's last. A few after a network blip is the mechanism working. A steady stream is a client that numbers its orders wrongly, and none of its orders are reaching the book. |
 | `gateway idle_timeouts` | Connections ended because nothing was heard on them. Each is a client whose line or program died, or one that does not send heartbeats. A burst of them at once points at the network, or at a timeout set too short. |
 | `gateway login_timeouts` | Connections that kept talking but never logged in. |
 | `gateway session_closes` | Times a shard was told that a client had gone: the number of shards for each logged-in connection that ended. |
@@ -240,8 +279,12 @@ start again. There is no rotation.
 
 **Sessions:** after a restart, clients must log in again. Each is the same
 session as before, because a session id is a client id, and each finds
-that nothing of its rests any more. What filled before the venue went down
-is not reported again (W-04).
+that nothing of its rests any more. The venue has a new epoch and its
+report numbers start again at 1. A client that asks is sent the `Canceled`
+for each order the restart took from it, but what filled before the venue
+went down is not reported again (W-98): `planck-replay --dump` on the
+journal shows it. Order ids are remembered: an order from before the
+restart that a client sends again is still ignored.
 
 ## The other programs
 
@@ -253,7 +296,16 @@ pipe.
 ```
 planck-client [--connect ADDRESS:PORT] [--client-id N] [--token N] [--linger MS]
                defaults: 127.0.0.1:9000, 1, 0, 200
+              [--epoch N] [--next-report N]
+               defaults: 0, 0: ask for nothing from before
 ```
+
+It numbers its orders from one above the highest id the venue has had from
+that client id, so a second run does not repeat the ids of the first. When
+it leaves it prints `left at --epoch E --next-report N`. Started again with
+those, it asks the venue for the reports the client id was sent since,
+prints each with `earlier #N:` in front, prints `caught up`, and only then
+reads commands. It does not reconnect by itself (W-101).
 
 It sends heartbeats by itself, as often as the venue's timeout calls for,
 and gives up if it hears nothing from the venue for twice that timeout.
@@ -324,5 +376,5 @@ See [benchmarks.md](benchmarks.md).
 
 Before putting this in front of anyone, read the Gateway, Feed, Journal and
 Programs sections of [weaknesses.md](weaknesses.md). In short: a login
-token sent in the clear, no report recovery, no feed snapshots, an unprotected retransmit port, asynchronous
+token sent in the clear, report recovery that does not reach back past a restart, no feed snapshots, an unprotected retransmit port, asynchronous
 durability, no clean shutdown for clients, and no monitoring beyond stdout.

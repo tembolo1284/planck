@@ -174,9 +174,12 @@ where it is weakest, and what is next. Ids point into
   stall another.
 - **Know first:** a session is not a connection (S-24). Read the comment
   above `class Gateway` before anything else.
-- **Weakest:** this is where most of the agreed plan lands. Next is W-04,
-  report sequence numbers and recovery. Also W-08 (the token is sent in the
-  clear) and W-61 clean shutdown.
+- **Weakest:** held reports live in memory and do not survive a restart
+  (W-98, W-99). Also W-08 (the token is sent in the clear) and W-61 clean
+  shutdown.
+- **One way out:** every report to a session goes through `deliver()`. Do
+  not queue one directly, or its number is lost and every later number the
+  client counts is wrong.
 - **Testing time:** the gateway takes its clock from its configuration.
   Tests about timeouts pass their own and step it. Do not write one that
   sleeps.
@@ -234,15 +237,14 @@ where it is weakest, and what is next. Ids point into
 ## What to do next, in order
 
 The order was agreed on 2026-11-26 and is kept as the "Agreed plan" at the
-top of [decisions.md](decisions.md). Steps 1 and 2 and the first half of
-step 3 are done. In short:
+top of [decisions.md](decisions.md). Steps 1, 2 and 3 are done. In short:
 
-1. Report sequence numbers and recovery, idempotent orders (W-04).
-2. A commit boundary for reports and market data, after measuring the time
-   to durable (D-12, D-13, W-80).
-3. Snapshots and a separate recovery service for the feed (D-05, W-10,
+1. A commit boundary for reports and market data, after measuring the time
+   to durable (D-12, D-13, W-80). Held reports that survive a restart
+   belong here too (W-98).
+2. Snapshots and a separate recovery service for the feed (D-05, W-10,
    W-11).
-4. A failed market data consumer must not stop matching (W-21).
+3. A failed market data consumer must not stop matching (W-21).
 
 Alongside, whenever there is hardware for it: measure on real machines
 (W-50), and profile the 70 ns around the book (W-24).

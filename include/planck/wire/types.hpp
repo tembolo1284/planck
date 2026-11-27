@@ -24,7 +24,9 @@ static_assert(std::endian::native == std::endian::little,
 
 // Version 2: neither side answers a Heartbeat any more, and LoginAccepted
 // says how long the venue lets a client stay silent.
-inline constexpr std::uint16_t kProtocolVersion = 2;
+// Version 3: reports are numbered so that a client can ask for the ones it
+// missed, and a client order id that is not above the last one is ignored.
+inline constexpr std::uint16_t kProtocolVersion = 3;
 
 // Largest message in the protocol. Buffers of this size hold any message.
 inline constexpr std::size_t kMaxMessageSize = 48;
@@ -55,6 +57,14 @@ enum class MsgType : std::uint8_t {
     MdExecuted = 0x41,
     MdDeleted = 0x42,
 };
+
+// True for the messages a venue numbers for a session: see order_entry.hpp.
+// A client counts these, and nothing else, to know which report is which.
+[[nodiscard]] constexpr bool is_report(MsgType type) noexcept {
+    return type == MsgType::OrderAccepted || type == MsgType::OrderRejected ||
+           type == MsgType::Executed || type == MsgType::Canceled ||
+           type == MsgType::CancelRejected;
+}
 
 // First four bytes of every message.
 struct MsgHeader {
@@ -102,6 +112,8 @@ enum class LoginRejectReason : std::uint8_t {
     AlreadyLoggedIn = 1,
     UnsupportedVersion = 2,
     ServerFull = 3,
+    // The client asked for reports from a number the venue has not reached.
+    BadSequence = 4,
 };
 
 // A struct that can go on the wire as is: starts with a MsgHeader, names its

@@ -112,6 +112,15 @@ due_mean="$(awk -F, '$1 == "order.due_to_answer" { print $10 }' "$work/late.log"
 awk -v sent="$sent_mean" -v due="$due_mean" 'BEGIN { exit !(sent > 0 && due - sent > 50000) }' \
     || fail "late orders were not measured as late (mean from sent $sent_mean ns, from due $due_mean ns)"
 
+# A second run as a client that has traded before. The venue ignores an
+# order whose id is not above the client's last, so the generator has to
+# carry on from where that client left off, as the venue tells it at login.
+"$bench/planck-loadgen" --server "127.0.0.1:$base" --orders 200 --warmup 0 --symbols 4 \
+    --client-id 4000 > "$work/again.log" 2> "$work/again-err.log" \
+    || fail "planck-loadgen (same client again) did not finish cleanly"
+expect again-err.log "sent 200, accepted 200, rejected 0 " \
+    "a client that had traded before had its orders taken for repeats"
+
 # Every run cancelled what it left resting, so the books end empty. The
 # venue prints its counters once a second: look at the newest line only,
 # since the lines from before the load say zero as well.
@@ -124,8 +133,18 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 [ "$emptied" = yes ] || fail "orders were left resting after the load generators finished"
+# Empty books alone prove little: the venue cancels whatever a client leaves
+# behind when it disconnects. A generator that tidied up left it nothing.
+grep "^stats engine" "$work/venue.log" | tail -n 1 | grep -q " disconnect_cancels=0 " \
+    || fail "a load generator left orders behind for the venue to cancel"
 grep "^stats engine" "$work/venue.log" | tail -n 1 | grep -Eq "commands=[1-9]" \
     || fail "the venue's counters never showed the load"
+if grep -Eq "protocol_errors=[1-9]|slow_consumers=[1-9]" "$work/venue.log"; then
+    fail "the venue threw a load generator session out"
+fi
+if grep -Eq "duplicate_orders=[1-9]" "$work/venue.log"; then
+    fail "the venue ignored orders from a load generator"
+fi
 
 # A venue that is not there.
 "$bench/planck-loadgen" --server "127.0.0.1:$((base + 2))" --orders 10 > "$work/nobody.log" 2>&1
