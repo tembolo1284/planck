@@ -1,0 +1,174 @@
+"""The bugs that tools/seeded_bugs.py plants.
+
+Each entry is one small change that makes the code wrong:
+
+    label    what the bug is, in a few words. Must be unique.
+    file     the file to change, relative to the repository.
+    find     text that occurs exactly once in that file.
+    replace  what to put in its place.
+    tests    a ctest -R pattern naming the tests that ought to notice.
+
+Add an entry whenever a bug is fixed or a risky line is written: the change
+that would bring the bug back. If a bug survives, a test is missing. Keep
+`find` long enough to be unique and short enough to survive reformatting.
+"""
+
+CAPI = "capi/src/planck.cpp"
+CAPI_TESTS = "Capi|capi"
+FLOW = "bench/flow.hpp"
+BENCH_UNIT = "Bench"
+LOADGEN = "bench/planck_loadgen.cpp"
+BOOK = "include/planck/book/order_book.hpp"
+BOOK_TESTS = "OrderBook|Book|Shard"
+
+BUGS = [
+    # ---- the C interface: sizing and holding back ----
+    {"label": "capi: report queue sized for one fill per order", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "return (2 * std::size_t{orders}) + 2;",
+     "replace": "return std::size_t{orders} + 2;"},
+    {"label": "capi: report queue one short", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "return (2 * std::size_t{orders}) + 2;",
+     "replace": "return (2 * std::size_t{orders}) + 1;"},
+    {"label": "capi: market queue sized for half a sweep", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "    return std::size_t{orders};\n",
+     "replace": "    return std::size_t{orders} / 2;\n"},
+    {"label": "capi: market queue one short", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "    return std::size_t{orders};\n",
+     "replace": "    return std::size_t{orders} - 1;\n"},
+    {"label": "capi: holds back only when completely full", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "return reports_free >= self.reports_needed && market_free >= self.market_needed;",
+     "replace": "return reports_free >= 1 && market_free >= 1;"},
+    {"label": "capi: report queue never checked", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "self->reports_needed = worst_reports(orders);",
+     "replace": "self->reports_needed = 0;"},
+    {"label": "capi: market queue never checked", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "self->market_needed = worst_market(orders);",
+     "replace": "self->market_needed = 0;"},
+    {"label": "capi: zero capacity not defaulted", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "(config->order_capacity != 0) ? config->order_capacity : default_orders;",
+     "replace": "config->order_capacity;  static_cast<void>(default_orders);"},
+
+    # ---- the C interface: checking what comes in ----
+    {"label": "capi: session above 65535 allowed", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "if (order->session == 0 || order->session > PLANCK_MAX_SESSION) {",
+     "replace": "if (order->session == 0) {"},
+    {"label": "capi: reserved bytes not checked", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "if (byte != 0) {",
+     "replace": "if (false && byte != 0) {"},
+    {"label": "capi: struct size barely checked", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "if (config.struct_size != sizeof(planck_config)) {",
+     "replace": "if (config.struct_size == 0) {"},
+    {"label": "capi: symbol reserved not checked", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "        if (symbol.reserved != 0) {\n            return PLANCK_INVALID_ARGUMENT;\n        }\n",
+     "replace": ""},
+    {"label": "capi: failed create leaves the handle alone", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "    *out = nullptr;\n    if (config == nullptr) {",
+     "replace": "    if (config == nullptr) {"},
+    {"label": "capi: null report pointer written through", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "if (engine == nullptr || out == nullptr) {\n        return 0;\n    }\n    engine::Report report;",
+     "replace": "if (engine == nullptr) {\n        return 0;\n    }\n    engine::Report report;"},
+    {"label": "capi: every cancel comes from session 1", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "const core::SessionId owner{static_cast<std::uint16_t>(session)};",
+     "replace": "const core::SessionId owner{static_cast<std::uint16_t>(1)}; static_cast<void>(session);"},
+
+    # ---- the C interface: translating what goes out ----
+    {"label": "capi: fill qty and leaves swapped", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "out.qty = message.qty;\n            out.leaves = message.leaves;",
+     "replace": "out.qty = message.leaves;\n            out.leaves = message.qty;"},
+    {"label": "capi: cancel reason dropped", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "out.qty = message.qty;\n            out.reason = std::to_underlying(message.reason);",
+     "replace": "out.qty = message.qty;"},
+    {"label": "capi: cancel reject reported as cancel", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "out.kind = PLANCK_REPORT_CANCEL_REJECTED;",
+     "replace": "out.kind = PLANCK_REPORT_CANCELED;"},
+    {"label": "capi: trade print names the wrong order", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "out.kind = PLANCK_MARKET_TRADE;\n            out.symbol = message.symbol_id;\n            out.order_id = message.order_id;",
+     "replace": "out.kind = PLANCK_MARKET_TRADE;\n            out.symbol = message.symbol_id;\n            out.order_id = message.match_id;"},
+    {"label": "capi: says there is a market event when there is none", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "    if (!engine->shard.market().try_pop(event)) {\n        return 0;\n    }",
+     "replace": "    if (!engine->shard.market().try_pop(event)) {\n        return 1;\n    }"},
+    {"label": "capi: best() looks at the other side", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "order_book->best(static_cast<core::Side>(side))",
+     "replace": "order_book->best(static_cast<core::Side>(side ^ 1U))"},
+    {"label": "capi: best price off by one", "file": CAPI, "tests": CAPI_TESTS,
+     "find": "out->price = quote.valid ? quote.price.raw() : 0;",
+     "replace": "out->price = quote.price.raw() + 1;"},
+    {"label": "capi: resting count wrong", "file": CAPI, "tests": CAPI_TESTS,
+     "find": ".resting = engine->shard.store().in_use()}",
+     "replace": ".resting = stats.accepted}"},
+
+    # ---- benchmark helpers ----
+    {"label": "bench: pacer reschedules from now", "file": FLOW, "tests": BENCH_UNIT,
+     "find": "next_ += interval_;",
+     "replace": "next_ = now + interval_;"},
+    {"label": "bench: pacer late by a tick", "file": FLOW, "tests": BENCH_UNIT,
+     "find": "if (now < next_) {",
+     "replace": "if (now <= next_) {"},
+    {"label": "bench: send log answers twice", "file": FLOW, "tests": BENCH_UNIT,
+     "find": "        out = entry.times;\n        entry.id = 0;",
+     "replace": "        out = entry.times;"},
+    {"label": "bench: send log overwrites unanswered", "file": FLOW, "tests": BENCH_UNIT,
+     "find": "        if (entry.id != 0) {\n            return false;\n        }\n",
+     "replace": ""},
+    {"label": "bench: send log matches any id in the slot", "file": FLOW, "tests": BENCH_UNIT,
+     "find": "if (id == 0 || entry.id != id) {",
+     "replace": "if (entry.id == 0) {"},
+    {"label": "bench: fifo gives newest first", "file": FLOW, "tests": BENCH_UNIT,
+     "find": "        out = ids_[head_ & (N - 1)];\n        ++head_;",
+     "replace": "        --tail_;\n        out = ids_[tail_ & (N - 1)];"},
+    {"label": "bench: stopwatch underflows", "file": "bench/harness.hpp", "tests": BENCH_UNIT,
+     "find": "return (ticks > overhead_ticks_) ? (ticks - overhead_ticks_) : 0;",
+     "replace": "return ticks - overhead_ticks_;"},
+    {"label": "bench: takes off more than the timer costs", "file": "bench/harness.cpp",
+     "tests": BENCH_UNIT,
+     "find": "overhead_ticks_ = overhead_.min();",
+     "replace": "overhead_ticks_ = overhead_.percentile(0.99);"},
+
+    # ---- the load generator ----
+    {"label": "loadgen: last warm-up order is timed", "file": LOADGEN, "tests": "bench_smoke",
+     "find": "if (answered_ >= options_.warmup) {",
+     "replace": "if (answered_ + 1 >= options_.warmup) {"},
+    {"label": "loadgen: half the rate asked for", "file": LOADGEN, "tests": "bench_smoke",
+     "find": "fixed_rate ? (watch_.ticks_per_second() / options_.rate) : 0;",
+     "replace": "fixed_rate ? (2 * watch_.ticks_per_second() / options_.rate) : 0;"},
+    {"label": "loadgen: leaves its orders behind", "file": LOADGEN, "tests": "bench_smoke",
+     "find": "        while (session.resting.pop(id)) {",
+     "replace": "        while (false && session.resting.pop(id)) {"},
+    {"label": "loadgen: window ignored", "file": LOADGEN, "tests": "bench_smoke",
+     "find": "if (session.unanswered < options_.window && room_to_send(session)) {",
+     "replace": "if (room_to_send(session)) {"},
+    {"label": "loadgen: window always 1", "file": LOADGEN, "tests": "bench_smoke",
+     "find": "if (session.unanswered < options_.window && room_to_send(session)) {",
+     "replace": "if (session.unanswered < 1 && room_to_send(session)) {"},
+    {"label": "loadgen: due-time row shows send-time numbers", "file": LOADGEN, "tests": "bench_smoke",
+     "find": 'table.row("order.due_to_answer", response_);',
+     "replace": 'table.row("order.due_to_answer", service_);'},
+    {"label": "loadgen: lateness never recorded", "file": LOADGEN, "tests": "bench_smoke",
+     "find": ".intended = (intended != 0) ? intended : now,",
+     "replace": ".intended = (intended != 0) ? now : now,"},
+    {"label": "loadgen: response measured from send", "file": LOADGEN, "tests": "bench_smoke",
+     "find": "response_.record(watch_.adjust(now - times.intended));",
+     "replace": "response_.record(watch_.adjust(now - times.sent));"},
+
+    # ---- the book, the ring and the gateway ----
+    {"label": "book: a buy does not trade at its own limit", "file": BOOK, "tests": BOOK_TESTS,
+     "find": "return buy ? (level <= limit) : (level >= limit);",
+     "replace": "return buy ? (level < limit) : (level >= limit);"},
+    {"label": "book: best bid tracks the lowest bid", "file": BOOK, "tests": BOOK_TESTS,
+     "find": "best_bid_ = (best_bid_ == kNoLevel) ? offset : std::max(best_bid_, offset);",
+     "replace": "best_bid_ = (best_bid_ == kNoLevel) ? offset : std::min(best_bid_, offset);"},
+    {"label": "book: cancel reaches into another symbol", "file": BOOK, "tests": BOOK_TESTS,
+     "find": "if (order.symbol != symbol_) [[unlikely]] {",
+     "replace": "if (false) [[unlikely]] {"},
+    {"label": "book: cancel leaves the level total alone", "file": BOOK, "tests": BOOK_TESTS,
+     "find": "    level.total -= order.qty.raw();\n",
+     "replace": ""},
+    {"label": "ring: stale view not refreshed unless empty (F-01)",
+     "file": "include/planck/ring/spsc.hpp", "tests": "Ring",
+     "find": "if ((consumer_.cached_tail - head) < want) {",
+     "replace": "if ((consumer_.cached_tail - head) == 0 && want != 0) {"},
+    {"label": "gateway: session ids restart at 1 after a restart (F-08)",
+     "file": "src/gateway/gateway.cpp", "tests": "apps_smoke|Gateway",
+     "find": "next_session_id_ = config.first_session_id;",
+     "replace": "next_session_id_ = 1; static_cast<void>(config.first_session_id);"},
+]

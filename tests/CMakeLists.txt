@@ -93,3 +93,18 @@ if(TARGET planck_capi)
     )
     target_link_libraries(planck_capi_tests PRIVATE planck::capi)
 endif()
+
+# The scripts around the build, and the house rules no compiler checks.
+add_test(NAME scripts_smoke
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/e2e/scripts_smoke.sh ${PROJECT_SOURCE_DIR})
+set_tests_properties(scripts_smoke PROPERTIES LABELS tools TIMEOUT 60)
+
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(Python3_FOUND)
+    add_test(NAME style
+             COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/check_style.py
+                     ${PROJECT_SOURCE_DIR})
+    add_test(NAME tools_selftest
+             COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/tests/test_tools.py)
+    set_tests_properties(style tools_selftest PROPERTIES LABELS tools TIMEOUT 60)
+endif()

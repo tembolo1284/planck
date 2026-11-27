@@ -39,8 +39,13 @@ target_compile_definitions(planck_capi PRIVATE
 target_link_libraries(planck_capi PRIVATE planck_flags Threads::Threads)
 # Export the functions in planck.h and nothing else, and refuse to link if
 # the library depends on a symbol nothing provides.
+# CMake names the C++ runtime on the link line whenever a target has C++
+# sources. --as-needed tells the linker to leave out any library the code
+# does not in fact use, so the runtime is dropped again. GCC's driver asks
+# for that by default on some systems. Clang's does not.
 target_link_options(planck_capi PRIVATE
     -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/planck.map
+    -Wl,--as-needed
 )
 if(NOT PLANCK_SANITIZE)
     # Sanitizer runtimes are found at load time, so this check only works

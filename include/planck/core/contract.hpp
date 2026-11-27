@@ -50,10 +50,23 @@ namespace planck::core {
 #if PLANCK_CONTRACT_MODE == PLANCK_CONTRACT_CHECKED
 #define PLANCK_CONTRACT_(kind, cond) PLANCK_CONTRACT_CHECK_(kind, cond)
 #elif PLANCK_CONTRACT_MODE == PLANCK_CONTRACT_ASSUME
-#if defined(__has_cpp_attribute) && __has_cpp_attribute(assume) >= 202207L
+#if defined(__clang__)
+// Clang has had __builtin_assume far longer than it has had [[assume]], so
+// this works on every version. Clang warns when the condition calls a
+// function it cannot prove harmless, which is most of the conditions here.
+// They are free of side effects by rule (see above), so the warning is
+// turned off for just this statement.
+#define PLANCK_CONTRACT_(kind, cond)                                                \
+    do {                                                                            \
+        _Pragma("clang diagnostic push")                                            \
+        _Pragma("clang diagnostic ignored \"-Wassume\"")                            \
+        __builtin_assume(cond);                                                     \
+        _Pragma("clang diagnostic pop")                                             \
+    } while (false)
+#elif defined(__has_cpp_attribute) && __has_cpp_attribute(assume) >= 202207L
 #define PLANCK_CONTRACT_(kind, cond) [[assume(cond)]]
 #else
-#error "contract mode 'assume' needs [[assume]]: GCC 13+ or Clang 19+"
+#error "contract mode 'assume' needs [[assume]] (GCC 13 or later) or Clang"
 #endif
 #else
 #define PLANCK_CONTRACT_(kind, cond) static_cast<void>(0)
