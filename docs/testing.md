@@ -1,6 +1,6 @@
 # Testing
 
-308 tests. This page says how to run them, what each group proves, and what
+324 tests. This page says how to run them, what each group proves, and what
 is expected of new code.
 
 ## Running
@@ -36,14 +36,14 @@ Each test has a label. `-L` selects by it.
 
 | Label | Count | What it is | Programs |
 |-------|------:|------------|----------|
-| `unit` | 215 | One module at a time, deterministic, fast | `planck_unit_tests`, `planck_apps_tests`, `planck_bench_tests` |
-| `property` | 21 | Random runs against an independent model | `planck_property_tests` |
-| `integration` | 46 | More than one thread, or real sockets on loopback | `planck_integration_tests` |
+| `unit` | 225 | One module at a time, deterministic, fast | `planck_unit_tests`, `planck_apps_tests`, `planck_bench_tests` |
+| `property` | 22 | Random runs against an independent model | `planck_property_tests` |
+| `integration` | 51 | More than one thread, or real sockets on loopback | `planck_integration_tests` |
 | `capi` | 21 | The C library, from C++, C and Python | `planck_capi_tests`, `planck_capi_smoke`, two scripts |
 | `e2e` | 2 | The programs as separate processes | `apps_smoke.sh`, `bench_smoke.sh` |
 | `tools` | 3 | The scripts and the house rules | `scripts_smoke.sh`, `check_style.py`, `test_tools.py` |
 
-Sanitizer builds run 307, because the Python test of the C library is
+Sanitizer builds run 323, because the Python test of the C library is
 skipped there. So does a machine without Python's `cffi`.
 
 ### unit (`tests/unit/`)
@@ -57,7 +57,7 @@ skipped there. So does a machine without Python's `cffi`.
 | `ladder_bitmap_test.cpp` | Finding the next occupied price level |
 | `order_book_test.cpp` | Every matching rule: priority, partial fills, IOC, FOK, market orders, bands, capacity, cancels |
 | `wire_test.cpp` | Every message: size, round trip, truncation, bad type, reserved bytes, plus golden bytes that pin the format |
-| `shard_test.cpp` | A shard driven by hand: reports, market events, stalls, journaling, replay |
+| `shard_test.cpp` | A shard driven by hand: reports, market events, stalls, journaling, replay, sessions closing |
 | `net_test.cpp` | Address parsing, TCP and UDP sockets, the poller |
 | `perf_test.cpp` | Histogram buckets and percentiles |
 | `journal_test.cpp` | File format, reader, writer, torn tails, damage in the middle |
@@ -78,7 +78,9 @@ every result against something that shares no code with the engine.
 | `journal_replay_test.cpp` | Itself: a run is stopped, rebuilt from its journal and continued. Books and the feed must come out exactly as before. Also torn tails, damage in the middle, wrong configurations and sync timing. |
 
 Set `PLANCK_TEST_SCALE=20` in the environment to run twenty times as many
-commands. Do that before a release and after touching `book/` or `engine/`.
+commands. Do that before a release and after touching `book/` or `engine/`:
+it takes about three minutes, and it is what found a close that could wait
+for ever on a single thread, which no shorter run had hit.
 
 ### integration (`tests/integration/`)
 
@@ -86,7 +88,7 @@ commands. Do that before a release and after touching `book/` or `engine/`.
 |------|--------|
 | `ring_stress_test.cpp` | Two threads, millions of messages, every one delivered once and in order, for several ring sizes |
 | `shard_thread_test.cpp` | A shard on its own thread through a long random run, with a `FeedAuditor` checking every message |
-| `gateway_test.cpp` | Login and who is let in, sessions that outlive connections, routing, rejects, protocol violations, disconnects, connection limits, all over real TCP |
+| `gateway_test.cpp` | Login and who is let in, sessions that outlive connections, cancel on disconnect, routing, rejects, protocol violations, connection limits, all over real TCP |
 | `feed_test.cpp` | Sequencing, batching, heartbeats, gaps, retransmission, giving up, and a book rebuilt across a real socket |
 | `full_stack_test.cpp` | Shard, gateway and publisher threads together, with clients on TCP and a subscriber on UDP |
 | `journal_thread_test.cpp` | Shard on one thread and recorder on another: every command reaches the file, in order |
@@ -95,9 +97,11 @@ commands. Do that before a release and after touching `book/` or `engine/`.
 
 `apps_smoke.sh` starts `planckd`, trades through it with `planck-client`,
 watches the feed with `planck-mdtap`, kills the venue with `kill -9`,
-restarts it from the journal and checks that books, feed and the ownership
-of resting orders carried over. The venue runs with a clients file, and the
-test checks that a wrong token and an unlisted client are turned away.
+restarts it from the journal and checks that the feed carried over and that
+the orders left by the crash were cancelled. It also checks that a client
+that leaves has its orders cancelled. The venue runs with a clients file,
+and the test checks that a wrong token and an unlisted client are turned
+away.
 `bench_smoke.sh` runs both benchmark programs and
 checks that their figures add up.
 
@@ -106,8 +110,8 @@ checks that their figures add up.
 | File | Gives you |
 |------|-----------|
 | `reference_book.hpp` | `ReferenceBook`, the slow and obviously correct order book |
-| `feed_auditor.hpp` | `FeedAuditor`, and `RandomFlow`, which produces plausible and implausible commands |
-| `shard_harness.hpp` | `small_shard()`, `new_order()`, `cancel_order()`, and `as<T>()` to decode what a shard emitted |
+| `feed_auditor.hpp` | `FeedAuditor`, and `RandomFlow`, which produces plausible and implausible commands, sessions closing among them |
+| `shard_harness.hpp` | `small_shard()`, `new_order()`, `cancel_order()`, `session_closed()`, and `as<T>()` to decode what a shard emitted |
 | `wire_client.hpp` | `WireClient`, a minimal order entry client over TCP that never blocks |
 | `fixtures.hpp` | `TradeLog`, and `scaled()` for `PLANCK_TEST_SCALE` |
 | `temp_dir.hpp` | `TempDir`, a directory removed when the test ends |
@@ -120,7 +124,7 @@ at a time in a private copy of the repository, rebuilds, and confirms that
 a test fails.
 
 ```bash
-tools/seeded_bugs.py                # all 56, about 25 minutes on two CPUs
+tools/seeded_bugs.py                # all 80, about 35 minutes on two CPUs
 tools/seeded_bugs.py --only capi    # the ones whose label matches
 tools/seeded_bugs.py --list
 ```
@@ -136,8 +140,9 @@ the bug back. `tools_selftest` checks on every test run that each entry's
 pattern still occurs exactly once in the source, so the catalogue cannot
 silently rot.
 
-The catalogue is lopsided: 39 of its 56 entries are in `capi/` and `bench/`
-and 12 are from the session work in `gateway/` (W-51). Backfilling the
+The catalogue is lopsided: 39 of its 80 entries are in `capi/` and `bench/`,
+12 are from the session work in `gateway/` and 24 are for cancel on
+disconnect (W-51). Backfilling the
 older modules is open work.
 
 ## What is expected of new code

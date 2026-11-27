@@ -493,5 +493,298 @@ TEST_F(ShardTest, CountsWhatItDid) {
     EXPECT_EQ(stats.stalls, 0U);
 }
 
+TEST_F(ShardTest, AClosedSessionLosesExactlyItsRestingOrders) {
+    const std::uint64_t first = rest(1, Side::Buy, 1000, 10);
+    const std::uint64_t other = rest(2, Side::Buy, 1000, 7);
+    const std::uint64_t second = rest(1, Side::Sell, 20, 5, 700);
+    const std::uint64_t third = rest(1, Side::Sell, 1010, 3);
+
+    submit(test::session_closed(1));
+
+    // Newest first, each told to its owner and taken off the feed.
+    const std::uint64_t expected[] = {third, second, first};
+    const std::uint32_t quantities[] = {3, 5, 10};
+    const std::uint16_t symbols[] = {3, 700, 3};
+    ASSERT_EQ(reports_.size(), 3U);
+    ASSERT_EQ(market_.size(), 3U);
+    for (std::size_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(reports_[i].session, core::SessionId{1});
+        const auto canceled = as<wire::Canceled>(reports_[i]);
+        EXPECT_EQ(canceled.order_id, expected[i]);
+        EXPECT_EQ(canceled.qty, quantities[i]);
+        EXPECT_EQ(canceled.reason, wire::CancelReason::Disconnected);
+        const auto deleted = as<wire::MdDeleted>(market_[i]);
+        EXPECT_EQ(deleted.order_id, expected[i]);
+        EXPECT_EQ(deleted.symbol_id, symbols[i]);
+        EXPECT_EQ(deleted.timestamp, canceled.timestamp);
+    }
+
+    // The other session is untouched, and can still cancel its own.
+    EXPECT_EQ(shard_->store().in_use(), 1U);
+    EXPECT_EQ(shard_->book(core::SymbolId{3})->quantity_at(core::Price{1000}), 7U);
+    EXPECT_EQ(shard_->book(core::SymbolId{3})->quantity_at(core::Price{1010}), 0U);
+    EXPECT_EQ(shard_->book(core::SymbolId{700})->quantity_at(core::Price{20}), 0U);
+    submit(cancel_order(2, other));
+    EXPECT_EQ(as<wire::Canceled>(reports_.at(0)).reason, wire::CancelReason::UserRequested);
+
+    // Closing again finds nothing. So does cancelling what the close took.
+    submit(test::session_closed(1));
+    EXPECT_TRUE(reports_.empty());
+    EXPECT_TRUE(market_.empty());
+    submit(cancel_order(1, first));
+    EXPECT_EQ(as<wire::CancelRejected>(reports_.at(0)).reason, wire::RejectCode::UnknownOrder);
+
+    EXPECT_EQ(shard_->stats().session_closes, 2U);
+    EXPECT_EQ(shard_->stats().disconnect_cancels, 3U);
+    EXPECT_EQ(shard_->stats().cancels, 1U) << "a disconnect is not a cancel request";
+}
+
+TEST_F(ShardTest, AClosedSessionKeepsNothingThatHadAlreadyLeftTheBook) {
+    const std::uint64_t filled = rest(1, Side::Sell, 1000, 4);
+    const std::uint64_t part_filled = rest(1, Side::Sell, 1001, 10);
+    const std::uint64_t cancelled = rest(1, Side::Sell, 1002, 6);
+    const std::uint64_t untouched = rest(1, Side::Sell, 1003, 8);
+    submit(new_order(2, 3, Side::Buy, 1001, 7, 1, TimeInForce::ImmediateOrCancel));
+    ASSERT_EQ(shard_->stats().trades, 2U);
+    submit(cancel_order(1, cancelled));
+    static_cast<void>(filled);
+
+    submit(test::session_closed(1));
+    ASSERT_EQ(reports_.size(), 2U) << "an order that had traded away or been cancelled came back";
+    ASSERT_EQ(market_.size(), 2U);
+    EXPECT_EQ(as<wire::Canceled>(reports_[0]).order_id, untouched);
+    EXPECT_EQ(as<wire::Canceled>(reports_[0]).qty, 8U);
+    EXPECT_EQ(as<wire::Canceled>(reports_[1]).order_id, part_filled);
+    EXPECT_EQ(as<wire::Canceled>(reports_[1]).qty, 7U) << "only what was still open";
+    EXPECT_EQ(shard_->store().in_use(), 0U);
+}
+
+TEST_F(ShardTest, ASlotUsedAgainBelongsToItsNewOwnerOnly) {
+    // The store hands the slot just freed to the next order. Free one of
+    // session 1's by a cancel and one by a fill, and let session 2 take both.
+    const std::uint64_t by_cancel = rest(1, Side::Buy, 1000, 5);
+    submit(cancel_order(1, by_cancel));
+    const std::uint64_t reused = rest(2, Side::Buy, 1000, 5);
+    ASSERT_EQ(reused & 0xFFFFFF, by_cancel & 0xFFFFFF) << "the test needs the slot to be reused";
+
+    const std::uint64_t by_fill = rest(1, Side::Sell, 1010, 2);
+    submit(new_order(3, 3, Side::Buy, 1010, 2, 1, TimeInForce::ImmediateOrCancel));
+    const std::uint64_t reused_too = rest(2, Side::Sell, 1010, 2);
+    ASSERT_EQ(reused_too & 0xFFFFFF, by_fill & 0xFFFFFF);
+    const std::uint64_t kept = rest(1, Side::Buy, 990, 1);
+
+    submit(test::session_closed(1));
+    ASSERT_EQ(reports_.size(), 1U) << "session 1 owned one order and lost " << reports_.size();
+    EXPECT_EQ(as<wire::Canceled>(reports_[0]).order_id, kept);
+    EXPECT_EQ(shard_->store().in_use(), 2U);
+
+    submit(test::session_closed(2));
+    ASSERT_EQ(reports_.size(), 2U);
+    EXPECT_EQ(as<wire::Canceled>(reports_[0]).order_id, reused_too);
+    EXPECT_EQ(as<wire::Canceled>(reports_[1]).order_id, reused);
+    EXPECT_EQ(shard_->store().in_use(), 0U);
+}
+
+TEST_F(ShardTest, AnOrderFilledByItsOwnSessionIsNotCancelledLater) {
+    const std::uint64_t maker = rest(1, Side::Sell, 1000, 5);
+    // The same session takes its own order and rests the remainder.
+    submit(new_order(1, 3, Side::Buy, 1000, 8, 1));
+    ASSERT_EQ(shard_->stats().trades, 1U);
+    const std::uint64_t remainder = as<wire::OrderAccepted>(reports_.at(0)).order_id;
+    static_cast<void>(maker);
+
+    submit(test::session_closed(1));
+    ASSERT_EQ(reports_.size(), 1U);
+    EXPECT_EQ(as<wire::Canceled>(reports_[0]).order_id, remainder);
+    EXPECT_EQ(as<wire::Canceled>(reports_[0]).qty, 3U);
+    EXPECT_EQ(shard_->store().in_use(), 0U);
+}
+
+TEST_F(ShardTest, ClosingASessionWithMoreOrdersThanTheStageLosesNothing) {
+    const std::size_t orders = (2 * Shard::kStageCapacity) + 37;
+    std::vector<std::uint64_t> ids;
+    for (std::size_t i = 0; i < orders; ++i) {
+        ids.push_back(rest(1, Side::Buy, 950 + static_cast<std::int32_t>(i % 40), 1));
+    }
+    const std::uint64_t bystander = rest(2, Side::Buy, 960, 9);
+
+    submit(test::session_closed(1));
+    ASSERT_EQ(reports_.size(), orders);
+    ASSERT_EQ(market_.size(), orders);
+    for (std::size_t i = 0; i < orders; ++i) {
+        ASSERT_EQ(as<wire::Canceled>(reports_[i]).order_id, ids[orders - 1 - i]) << i;
+        ASSERT_EQ(as<wire::MdDeleted>(market_[i]).order_id, ids[orders - 1 - i]) << i;
+    }
+    EXPECT_EQ(shard_->store().in_use(), 1U);
+    submit(cancel_order(2, bystander));
+    EXPECT_EQ(as<wire::Canceled>(reports_.at(0)).qty, 9U);
+}
+
+TEST_F(ShardTest, ACloseLargerThanTheRingsResumesAndNothingOvertakesIt) {
+    // Rings that hold one stage and no more, and nobody reading them while
+    // the shard works. The close cannot finish in one go, and must not wait.
+    ShardConfig config = small_shard();
+    config.report_ring_capacity = static_cast<std::uint32_t>(Shard::kStageCapacity);
+    config.market_ring_capacity = static_cast<std::uint32_t>(Shard::kStageCapacity);
+    start(config);
+    const std::size_t orders = (5 * Shard::kStageCapacity) + 11;
+    std::vector<std::uint64_t> ids;
+    for (std::size_t i = 0; i < orders; ++i) {
+        ids.push_back(rest(1, Side::Buy, 950 + static_cast<std::int32_t>(i % 40), 1));
+    }
+    reports_.clear();
+    market_.clear();
+
+    // The close, and right behind it an order from the session's next
+    // connection, which the close must not touch.
+    ASSERT_TRUE(shard_->commands().try_push(test::session_closed(1)));
+    ASSERT_TRUE(shard_->commands().try_push(new_order(1, 3, Side::Buy, 940, 7, 5)));
+    std::size_t polls = 0;
+    while (shard_->stats().accepted != orders + 1) {
+        static_cast<void>(shard_->poll());
+        collect();
+        ++polls;
+        ASSERT_LT(polls, 100U) << "the close made no progress";
+    }
+    EXPECT_GT(polls, 3U) << "the test meant the close to be interrupted";
+    EXPECT_GT(shard_->stats().stalls, 0U);
+
+    ASSERT_EQ(reports_.size(), orders + 1);
+    ASSERT_EQ(market_.size(), orders + 1);
+    for (std::size_t i = 0; i < orders; ++i) {
+        ASSERT_EQ(as<wire::Canceled>(reports_[i]).order_id, ids[orders - 1 - i]) << i;
+        ASSERT_EQ(as<wire::MdDeleted>(market_[i]).order_id, ids[orders - 1 - i]) << i;
+    }
+    // Every cancel carries the time of the one command that caused them.
+    EXPECT_EQ(as<wire::Canceled>(reports_[0]).timestamp,
+              as<wire::Canceled>(reports_[orders - 1]).timestamp);
+    EXPECT_EQ(as<wire::OrderAccepted>(reports_[orders]).client_order_id, 5U)
+        << "the next command was taken before the close was finished";
+    EXPECT_EQ(shard_->store().in_use(), 1U);
+    EXPECT_EQ(shard_->stats().disconnect_cancels, orders);
+    EXPECT_EQ(shard_->stats().commands, orders + 2);
+}
+
+TEST_F(ShardTest, AReplayedCloseLargerThanTheStageStillTellsNobody) {
+    ShardConfig config = small_shard();
+    config.market_ring_capacity = static_cast<std::uint32_t>(Shard::kStageCapacity);
+    start(config);
+    const std::size_t orders = (3 * Shard::kStageCapacity) + 5;
+    std::uint64_t now = 1'000;
+    const auto replay = [&](const Command& command) {
+        std::size_t tries = 0;
+        while (!shard_->try_replay(command, now)) {
+            collect();
+            ASSERT_LT(++tries, 100U);
+        }
+        ++now;
+    };
+    for (std::size_t i = 0; i < orders; ++i) {
+        replay(new_order(1, 3, Side::Buy, 950, 1, i));
+    }
+    collect();
+    market_.clear();
+
+    replay(test::session_closed(1));
+    // try_replay() may return with the close part way through.
+    std::size_t tries = 0;
+    while (!shard_->try_finish()) {
+        collect();
+        ASSERT_LT(++tries, 100U);
+    }
+    collect();
+    EXPECT_GT(tries, 0U) << "the test meant the close to be interrupted";
+    EXPECT_TRUE(reports_.empty()) << "part of a replayed close was reported to a session";
+    EXPECT_EQ(market_.size(), orders);
+    EXPECT_EQ(shard_->store().in_use(), 0U);
+
+    // What comes after the replay is live, and is reported as usual.
+    submit(new_order(1, 3, Side::Buy, 950, 1, 9));
+    EXPECT_EQ(reports_.size(), 1U);
+}
+
+TEST_F(ShardTest, ClosingAllSessionsEmptiesEveryBook) {
+    // Session ids at both ends of the range, and the one in the middle that
+    // a 15-bit counter would miss.
+    const std::uint64_t low = rest(0, Side::Buy, 1000, 1);
+    const std::uint64_t mid = rest(32'768, Side::Buy, 1001, 2);
+    const std::uint64_t high = rest(65'535, Side::Sell, 30, 3, 700);
+    const std::uint64_t one = rest(1, Side::Sell, 1010, 4);
+
+    submit(make_all_sessions_closed());
+    ASSERT_EQ(reports_.size(), 4U);
+    ASSERT_EQ(market_.size(), 4U);
+    // In order of session id, so that a replay does the same.
+    const std::uint64_t expected[] = {low, one, mid, high};
+    const std::uint16_t owners[] = {0, 1, 32'768, 65'535};
+    for (std::size_t i = 0; i < 4; ++i) {
+        EXPECT_EQ(as<wire::Canceled>(reports_[i]).order_id, expected[i]);
+        EXPECT_EQ(as<wire::Canceled>(reports_[i]).reason, wire::CancelReason::Disconnected);
+        EXPECT_EQ(reports_[i].session, core::SessionId{owners[i]});
+    }
+    EXPECT_EQ(shard_->store().in_use(), 0U);
+    EXPECT_EQ(shard_->stats().disconnect_cancels, 4U);
+
+    // And the shard carries on as before.
+    const std::uint64_t again = rest(1, Side::Buy, 1000, 5);
+    submit(test::session_closed(1));
+    EXPECT_EQ(as<wire::Canceled>(reports_.at(0)).order_id, again);
+}
+
+TEST_F(ShardTest, WithoutCancelOnDisconnectAClosedSessionKeepsItsOrders) {
+    ShardConfig config = small_shard();
+    config.cancel_on_disconnect = false;
+    config.journal_ring_capacity = 64;
+    start(config);
+    EXPECT_FALSE(shard_->cancels_on_disconnect());
+    const std::uint64_t id = rest(1, Side::Buy, 1000, 10);
+
+    submit(test::session_closed(1));
+    submit(make_all_sessions_closed());
+    EXPECT_TRUE(reports_.empty());
+    EXPECT_TRUE(market_.empty());
+    EXPECT_EQ(shard_->store().in_use(), 1U);
+    EXPECT_EQ(shard_->stats().session_closes, 2U);
+    EXPECT_EQ(shard_->stats().disconnect_cancels, 0U);
+
+    // They are commands like any other all the same: counted and journaled.
+    EXPECT_EQ(shard_->sequence(), 3U);
+    std::vector<JournalEntry> entries;
+    shard_->journal().drain(64, [&](const JournalEntry& e) noexcept { entries.push_back(e); });
+    ASSERT_EQ(entries.size(), 3U);
+    EXPECT_EQ(entries[1].command.kind, CommandKind::SessionClosed);
+    EXPECT_EQ(entries[1].command.session, core::SessionId{1});
+    EXPECT_EQ(entries[2].command.kind, CommandKind::AllSessionsClosed);
+
+    submit(cancel_order(1, id));
+    EXPECT_EQ(as<wire::Canceled>(reports_.at(0)).qty, 10U);
+}
+
+TEST_F(ShardTest, AReplayedCloseCancelsTheSameOrdersAndTellsNobody) {
+    ASSERT_TRUE(small_shard().cancel_on_disconnect);
+    ASSERT_TRUE(shard_->cancels_on_disconnect());
+    std::uint64_t now = 1'000;
+    const auto replay = [&](const Command& command) {
+        ASSERT_TRUE(shard_->try_replay(command, ++now));
+        collect();
+    };
+    replay(new_order(1, 3, Side::Buy, 1000, 10, 1));
+    replay(new_order(2, 3, Side::Buy, 999, 4, 2));
+    replay(new_order(1, 700, Side::Sell, 10, 6, 3));
+    market_.clear();
+    reports_.clear();
+
+    replay(test::session_closed(1));
+    EXPECT_TRUE(reports_.empty()) << "a replay reports to nobody";
+    ASSERT_EQ(market_.size(), 2U);
+    EXPECT_EQ(as<wire::MdDeleted>(market_[0]).symbol_id, 700);
+    EXPECT_EQ(as<wire::MdDeleted>(market_[0]).timestamp, now);
+    EXPECT_EQ(as<wire::MdDeleted>(market_[1]).symbol_id, 3);
+    EXPECT_EQ(shard_->store().in_use(), 1U);
+
+    replay(make_all_sessions_closed());
+    EXPECT_EQ(shard_->store().in_use(), 0U);
+}
+
 }  // namespace
 }  // namespace planck::engine

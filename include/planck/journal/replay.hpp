@@ -87,6 +87,16 @@ template <typename OnStall>
         status = reader->next(entry);
     }
 
+    // The last command may have been a close with more orders to cancel
+    // than the rings would take in one go. See it through.
+    while (!shard.try_finish()) {
+        on_stall();
+        ++stalls;
+        if (stalls >= kMaxStalls) {
+            return Status::WouldBlock;
+        }
+    }
+
     out.ignored_bytes = reader->file_bytes() - reader->valid_bytes();
     if (status == Status::Protocol) {
         if (reader->records_after_damage()) {

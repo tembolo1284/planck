@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <map>
 #include <random>
+#include <set>
 #include <span>
 #include <unordered_map>
 #include <utility>
@@ -36,6 +37,27 @@ public:
     void expect_reply(std::uint64_t client_order_id, std::uint16_t session, std::uint32_t qty) {
         unanswered_[client_order_id] = Pending{session, qty};
     }
+
+    // Tell the auditor that a session, or every session, is about to be
+    // closed. Only then may orders be cancelled for that reason.
+    void expect_close(std::uint16_t session) { closed_sessions_.insert(session); }
+    void expect_close_of_all() { all_closed_ = true; }
+
+    // Nothing may be live for a session once its close has been carried out.
+    // Call only when everything the shard emitted has been seen.
+    void expect_nothing_live_for(std::uint16_t session) const {
+        for (const auto& [id, order] : private_orders_) {
+            EXPECT_FALSE(order.live && order.session == session)
+                << "order " << id << " outlived the connection of session " << session;
+        }
+    }
+    void expect_nothing_live() const {
+        for (const auto& [id, order] : private_orders_) {
+            EXPECT_FALSE(order.live) << "order " << id << " outlived every connection";
+        }
+        EXPECT_TRUE(public_orders_.empty()) << "the feed still shows orders";
+    }
+    [[nodiscard]] std::uint64_t disconnect_cancels() const { return disconnect_cancels_; }
 
     void on_market(const engine::MarketEvent& event) {
         ++market_count_;
@@ -237,6 +259,11 @@ private:
         EXPECT_TRUE(order->second.live);
         EXPECT_GT(message.qty, 0U);
         EXPECT_EQ(order->second.open, message.qty) << "cancelled quantity is not what was open";
+        if (message.reason == wire::CancelReason::Disconnected) {
+            EXPECT_TRUE(all_closed_ || closed_sessions_.contains(session))
+                << "order " << message.order_id << " cancelled for a disconnect nobody had";
+            ++disconnect_cancels_;
+        }
         order->second.open = 0;
         order->second.live = false;
     }
@@ -254,6 +281,9 @@ private:
     std::unordered_map<std::uint64_t, HalfMatch> half_reported_matches_;
     std::map<std::pair<std::uint16_t, std::int32_t>, std::uint64_t> depth_;
     std::vector<Candidate> candidates_;
+    std::set<std::uint16_t> closed_sessions_;
+    bool all_closed_ = false;
+    std::uint64_t disconnect_cancels_ = 0;
     std::uint64_t last_match_id_ = 0;
     std::uint64_t taker_qty_ = 0;
     std::uint64_t maker_qty_ = 0;
@@ -265,7 +295,8 @@ private:
 // Produces a stream of plausible and implausible commands: mostly passive
 // orders around a mid price, some that cross, cancels of live and dead
 // orders, cancels from the wrong session, unknown symbols, zero quantities
-// and prices outside the band.
+// and prices outside the band. Now and then a session loses its connection,
+// and once in a long while they all do.
 class RandomFlow {
 public:
     explicit RandomFlow(std::uint64_t seed) : rng_(seed) {}
@@ -284,6 +315,15 @@ public:
         }
         if (roll < 40) {
             return cancel_order(static_cast<std::uint16_t>(rng_() % kSessions), rng_());
+        }
+        if (roll == 99 && rng_() % 4 == 0) {
+            if (rng_() % 40 == 0) {
+                auditor.expect_close_of_all();
+                return engine::make_all_sessions_closed();
+            }
+            const auto session = static_cast<std::uint16_t>(rng_() % kSessions);
+            auditor.expect_close(session);
+            return session_closed(session);
         }
         return random_new_order(auditor);
     }

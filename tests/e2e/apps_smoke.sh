@@ -5,10 +5,12 @@
 #
 # Starts a venue on loopback, trades through it with two clients, and checks
 # what each client was told, what appeared on the market data feed, and that
-# a late subscriber can replay the feed. Then kills the venue outright,
-# starts it again from its journal, and checks that the books, the feed and
-# the ownership of resting orders all carried over. The venue runs with a
-# clients file throughout, so who may log in is checked as well.
+# a late subscriber can replay the feed. A client that leaves must have its
+# resting orders cancelled. Then kills the venue outright, starts it again
+# from its journal, and checks that the feed carried over, that the orders
+# left resting by the crash are cancelled, and that sessions are still the
+# same clients. The venue runs with a clients file throughout, so who may
+# log in is checked as well.
 set -u
 
 bin="${1:?usage: apps_smoke.sh <bin directory>}"
@@ -88,7 +90,7 @@ maker_pid=$!
 wait_for maker.log '^accepted client_order_id=1 '
 
 # The taker trades with it, rests an order of its own and cancels that, is
-# refused twice, and leaves an order resting in the other shard's symbol.
+# refused twice, rests an order in the other shard's symbol, and leaves.
 printf 'buy 1 4 1000\nbuy 1 3 990\ncancel last\nbuy 9 1 1000\nbuy 1 1 999999\nsell 2 5 500\n' |
     "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 2 --token 2002 \
     > "$work/taker.log" 2>&1 || fail "the taker exited with an error"
@@ -124,6 +126,14 @@ expect late.log '^1 add symbol=1 sell qty=10 price=1000 ' "the replay is missing
 expect late.log '^4 delete symbol=1 ' "the replay is missing message 4"
 expect late.log '^summary messages=4 .* lost=0$' "the replay lost messages"
 
+# The taker has gone, so the order it left in symbol 2 is cancelled: stream 0
+# shows it arrive and then go, with nobody having asked.
+timeout 20 "$bin/planck-mdtap" --stream 0 --listen "127.0.0.1:$quiet_feed_port" \
+    --retransmit "127.0.0.1:$retransmit_port" --from-start --count 2 \
+    > "$work/left.log" 2>&1 || fail "the order of a client that left was not cancelled"
+expect left.log '^1 add symbol=2 sell qty=5 price=500 ' "the taker's last order never rested"
+expect left.log '^2 delete symbol=2 ' "the order of a client that left is still in the book"
+
 # A second login under an id that is in use is refused.
 printf 'ping\n' |
     "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 1 --token 1001 \
@@ -146,13 +156,13 @@ expect stranger.log '^login rejected reason=BadCredentials$' "an unlisted client
 # signal handler runs and nothing is flushed on the way out.
 journal_holds() {
     "$bin/planck-replay" --file "$work/journal/shard-01.journal" > "$work/replay.log" 2>&1
-    grep -q '^commands=5 ' "$work/replay.log"
+    grep -q '^commands=7 ' "$work/replay.log"
 }
 for _ in $(seq 1 100); do
     journal_holds && break
     sleep 0.1
 done
-journal_holds || fail "the journal never received the five commands shard 1 handled"
+journal_holds || fail "the journal never received the seven commands shard 1 handled"
 expect replay.log '^intact$' "the journal is not intact"
 kill -KILL "$venue_pid"
 wait "$venue_pid" 2>/dev/null
@@ -163,45 +173,50 @@ maker_pid=""
 
 "$bin/planck-replay" --file "$work/journal/shard-01.journal" --dump > "$work/dump.log" 2>&1 ||
     fail "the journal did not survive the kill"
-expect dump.log '^1 .* session=1 sell symbol=1 qty=10 price=1000 day ' "journal record 1 is wrong"
-expect dump.log '^4 .* session=2 cancel order_id=' "journal record 4 is wrong"
-expect dump.log '^5 .* session=2 buy symbol=1 qty=1 price=999999 day ' \
+expect dump.log '^1 .* all sessions closed$' "a venue must open by closing every session"
+expect dump.log '^2 .* session=1 sell symbol=1 qty=10 price=1000 day ' "journal record 2 is wrong"
+expect dump.log '^5 .* session=2 cancel order_id=' "journal record 5 is wrong"
+expect dump.log '^6 .* session=2 buy symbol=1 qty=1 price=999999 day ' \
     "a command the book rejected must still be in the journal"
+expect dump.log '^7 .* session=2 closed$' "the taker's departure is not in the journal"
 
 # ---- And comes back ----
 
 start_venue venue2.log
-expect venue2.log '^shard 1 replayed 5 commands$' "shard 1 was not rebuilt from its journal"
-expect venue2.log '^shard 0 replayed 1 commands$' "shard 0 was not rebuilt from its journal"
+expect venue2.log '^shard 1 replayed 7 commands$' "shard 1 was not rebuilt from its journal"
+expect venue2.log '^shard 0 replayed 3 commands$' "shard 0 was not rebuilt from its journal"
 
-# The maker's order still has 6 left in the book, and it is still the
-# maker's: a session is a client id, on any connection and across a restart.
-# So the maker, back again, hears it trade. Another client cannot cancel it,
-# but can trade with it.
-printf 'wait 300000\n' |
+# The maker's order had 6 left when the venue died, and the journal brought
+# it back. But nobody is connected to a venue that has just started, so it
+# was cancelled before the first client could log in. The maker comes back
+# as the same session and starts afresh.
+maker_order="$(sed -n 's/^accepted client_order_id=1 order_id=\([0-9]*\) .*/\1/p' "$work/maker.log")"
+[ -n "$maker_order" ] || fail "could not find the maker's order id"
+printf 'cancel %s\nsell 1 2 1000\nwait 300000\n' "$maker_order" |
     "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 1 --token 1001 \
     > "$work/maker2.log" 2>&1 &
 maker_pid=$!
-wait_for maker2.log '^logged in client_id=1 session=1$'
-maker_order="$(sed -n 's/^accepted client_order_id=1 order_id=\([0-9]*\) .*/\1/p' "$work/maker.log")"
-[ -n "$maker_order" ] || fail "could not find the maker's order id"
-printf 'cancel %s\nbuy 1 6 1000\n' "$maker_order" |
+wait_for maker2.log '^accepted client_order_id=1 '
+expect maker2.log '^logged in client_id=1 session=1$' "a session id must be the client id"
+expect maker2.log "^cancel rejected order_id=$maker_order reason=UnknownOrder\$" \
+    "an order from before the restart was still there to cancel"
+
+# Another client trades with the new order and rests what is left over.
+printf 'buy 1 6 1000\n' |
     "$bin/planck-client" --connect "127.0.0.1:$order_port" --client-id 3 --token 3003 \
     > "$work/after.log" 2>&1 || fail "the client exited with an error after the restart"
-expect after.log '^logged in client_id=3 session=3$' "a session id must be the client id"
-expect after.log '^executed .* qty=6 price=1000 leaves=0 taker ' \
-    "the order resting before the crash did not trade after it"
-expect after.log "^cancel rejected order_id=$maker_order reason=UnknownOrder\$" \
-    "one client cancelled another's order"
-wait_for maker2.log '^executed .* qty=6 price=1000 leaves=0 maker '
+expect after.log '^executed .* qty=2 price=1000 leaves=4 taker ' \
+    "only the 2 offered after the restart may trade, not the 6 from before it"
+wait_for maker2.log '^executed .* qty=2 price=1000 leaves=0 maker '
 kill "$maker_pid" 2>/dev/null || true
 wait "$maker_pid" 2>/dev/null || true
 maker_pid=""
 
 # A subscriber replaying from the start sees the first life's messages
-# exactly as they were, followed by the new trade.
+# exactly as they were. Then the restart's cancel, the new order, the trade,
+# what client 3 left resting, and that being cancelled when client 3 left.
 timeout 20 "$bin/planck-mdtap" --stream 1 --listen "127.0.0.1:$feed_port" \
-    --retransmit "127.0.0.1:$retransmit_port" --from-start --count 5 \
+    --retransmit "127.0.0.1:$retransmit_port" --from-start --count 9 \
     > "$work/reborn.log" 2>&1 || fail "the subscriber did not finish after the restart"
 for line in 1 2 3 4; do
     before="$(grep "^$line " "$work/late.log")"
@@ -209,18 +224,33 @@ for line in 1 2 3 4; do
     [ -n "$before" ] && [ "$before" = "$after" ] ||
         fail "feed message $line changed across the restart: '$before' became '$after'"
 done
-expect reborn.log '^5 trade symbol=1 qty=6 price=1000 ' "the trade after the restart is not on the feed"
+expect reborn.log "^5 delete symbol=1 order_id=$maker_order " \
+    "the order left by the crash was not cancelled at the restart"
+expect reborn.log '^6 add symbol=1 sell qty=2 price=1000 ' "feed message 6 is wrong"
+expect reborn.log '^7 trade symbol=1 qty=2 price=1000 ' "the trade after the restart is not on the feed"
+expect reborn.log '^8 add symbol=1 buy qty=4 price=1000 ' "feed message 8 is wrong"
+expect reborn.log '^9 delete symbol=1 ' "the order of the client that left is still in the book"
+
+# Wait for the venue to have dealt with the maker leaving too: command 13
+# of shard 1, counting both lives.
+for _ in $(seq 1 100); do
+    "$bin/planck-replay" --file "$work/journal/shard-01.journal" > "$work/replay2.log" 2>&1
+    grep -q '^commands=13 ' "$work/replay2.log" && break
+    sleep 0.1
+done
+expect replay2.log '^commands=13 new_orders=6 cancels=2 closes=5 ' \
+    "the journal of shard 1 does not hold both lives"
 
 # Clean shutdown on SIGTERM, with final counters that match both lives.
 kill -TERM "$venue_pid"
 wait "$venue_pid" || fail "the venue did not exit cleanly"
 venue_pid=""
 expect venue2.log '^stopping$' "the venue did not notice the signal"
-expect venue2.log '^stats engine commands=8 accepted=5 rejected=2 trades=2 cancels=1 resting=1 ' \
+expect venue2.log '^stats engine commands=19 accepted=6 rejected=2 trades=2 cancels=1 disconnect_cancels=3 resting=0 ' \
     "the venue's final counters are wrong"
-expect venue2.log '^stats feed messages=6 ' "the venue's feed counters are wrong"
-expect venue2.log '^stats journal records=2 .* discarded=0 failed=0$' \
-    "the journal did not record the two commands of the second life"
+expect venue2.log '^stats feed messages=11 ' "the venue's feed counters are wrong"
+expect venue2.log '^stats journal records=9 .* discarded=0 failed=0$' \
+    "the journal did not record the nine commands of the second life"
 expect venue2.log '^stats latency reports=' "no latency was measured"
 
 echo "PASS"

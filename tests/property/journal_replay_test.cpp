@@ -222,6 +222,45 @@ TEST_F(JournalRecovery, TornTailIsDroppedAndTheRestIsKept) {
     EXPECT_EQ(again.replayed.records, run.shard->sequence());
 }
 
+TEST_F(JournalRecovery, AJournalThatEndsInALargeCloseIsReplayedToTheEnd) {
+    // A market ring that holds one stage, so that cancelling this many
+    // orders has to be done a piece at a time, with the ring emptied in
+    // between. The close is the last thing in the journal: nothing comes
+    // after it to push it through.
+    engine::ShardConfig config = journaling_shard();
+    config.market_ring_capacity = static_cast<std::uint32_t>(engine::Shard::kStageCapacity);
+    const std::size_t orders = (5 * engine::Shard::kStageCapacity) + 9;
+    {
+        Session run;
+        ASSERT_EQ(run.start(dir_.path(), config), Status::Ok);
+        const auto send = [&run](const engine::Command& command) {
+            while (!run.shard->commands().try_push(command)) {
+                run.pump();
+            }
+        };
+        for (std::size_t i = 0; i < orders; ++i) {
+            run.auditor.expect_reply(i, 1, 1);
+            send(test::new_order(1, 3, core::Side::Buy, 950, 1, i));
+        }
+        run.auditor.expect_close(1);
+        send(test::session_closed(1));
+        for (int i = 0; i < 1000 && run.shard->stats().disconnect_cancels != orders; ++i) {
+            run.pump();
+        }
+        ASSERT_EQ(run.shard->stats().disconnect_cancels, orders);
+        run.stop();
+        ASSERT_EQ(run.shard->sequence(), orders + 1);
+    }
+
+    Session again;
+    ASSERT_EQ(again.start(dir_.path(), config), Status::Ok);
+    EXPECT_EQ(again.replayed.records, orders + 1);
+    EXPECT_EQ(again.shard->store().in_use(), 0U) << "replay returned with the close unfinished";
+    EXPECT_EQ(again.shard->stats().disconnect_cancels, orders);
+    EXPECT_EQ(again.market.size(), 2 * orders) << "an add and a delete for every order";
+    again.auditor.expect_matches(*again.shard, test::kSymbols);
+}
+
 TEST_F(JournalRecovery, DamageInTheMiddleStopsTheStart) {
     first_run(500);
     {

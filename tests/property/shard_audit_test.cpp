@@ -56,6 +56,21 @@ TEST_P(ShardAudit, EveryMessageIsConsistent) {
         while (!shard->commands().try_push(command)) {
             pump();
         }
+        // A close must leave nothing behind. Let the shard carry it out and
+        // look at once, before the session sends anything more.
+        if (command.kind == CommandKind::SessionClosed ||
+            command.kind == CommandKind::AllSessionsClosed) {
+            for (int i = 0; i < 4; ++i) {
+                pump();
+            }
+            ASSERT_EQ(shard->stats().commands, sent + 1) << "the close has not been handled";
+            if (command.kind == CommandKind::SessionClosed) {
+                auditor.expect_nothing_live_for(command.session.raw());
+            } else {
+                auditor.expect_nothing_live();
+                EXPECT_EQ(shard->store().in_use(), 0U);
+            }
+        }
         if (sent % 7 == 0) {
             pump();
         }
@@ -80,6 +95,9 @@ TEST_P(ShardAudit, EveryMessageIsConsistent) {
     EXPECT_GT(stats.cancels, 0U);
     EXPECT_GT(stats.rejected, 0U);
     EXPECT_GT(stats.cancel_rejects, 0U);
+    EXPECT_GT(stats.session_closes, 0U);
+    EXPECT_GT(stats.disconnect_cancels, 0U) << "no close ever found an order to cancel";
+    EXPECT_EQ(stats.disconnect_cancels, auditor.disconnect_cancels());
     RecordProperty("trades", static_cast<int>(stats.trades));
     RecordProperty("resting_at_end", static_cast<int>(auditor.resting_orders()));
 }

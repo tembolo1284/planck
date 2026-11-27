@@ -28,7 +28,9 @@ inline constexpr std::array<char, 8> kMagic = {'P', 'L', 'N', 'K', 'J', 'R', 'N'
 // Version 2: a record's session is the client id its owner logs in with, the
 // same on every connection. In version 1 it was a number given to one
 // connection, so a version 1 journal cannot say who owns what and is refused.
-inline constexpr std::uint32_t kVersion = 2;
+// Version 3: two more kinds of record, for a session that lost its
+// connection and for all of them at once.
+inline constexpr std::uint32_t kVersion = 3;
 
 struct FileHeader {
     std::array<char, 8> magic = kMagic;

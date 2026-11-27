@@ -14,8 +14,8 @@ these documents brought up to date.
 | Step | What | Covers | State |
 |-----:|------|--------|-------|
 | 1 | Sessions that outlive connections, and a list of who may log in | D-02, W-02, W-05 | done: S-23, S-24 |
-| 2 | Cancel on disconnect, and at restart | D-01, D-14, W-01 | next |
-| 3 | Heartbeats, report sequence numbers, report recovery, idempotent orders | W-03, W-04 | |
+| 2 | Cancel on disconnect, and at restart | D-01, D-14, W-01 | done: S-27, S-28 |
+| 3 | Heartbeats, report sequence numbers, report recovery, idempotent orders | W-03, W-04, D-18 | next |
 | 4 | A commit boundary: nothing is told to anyone before it is durable. Measure the cost first. | D-12, D-13, W-70, W-71, W-80 | |
 | 5 | Feed snapshots and a separate, rate-limited recovery service | D-05, W-10, W-11, W-13 | |
 | 6 | A failed market data consumer must not stop matching | W-21 | |
@@ -25,12 +25,6 @@ Replicating commands to a standby engine comes after step 4, as a project
 of its own.
 
 ## Open
-
-### D-01 What happens to a client's orders when it disconnects
-- **Today:** they stay in the book and go on trading. They still belong to the client, which gets them back by logging in again (S-24). Fills that happen while it is away are not reported to it.
-- **Decided, not yet built:** cancel on disconnect first. The gateway tells every shard that the session has lost its connection, as a journaled command, and each shard cancels that session's resting orders. It needs a list of live orders per session, kept by the shard.
-- **Later:** let a client choose at login to keep its orders working while it is away, once reports can be recovered after a reconnect (W-04).
-- **Touches:** W-01, D-14.
 
 ### D-03 Slow order entry clients
 - **Today:** a client with more than 64 KiB of unread reports is disconnected.
@@ -89,11 +83,6 @@ of its own.
 - **Leaning:** the alternative. A venue that cannot record what it does should not be doing it. Left as it is for now because rejecting needs a path from the recorder back to the gateway.
 - **Touches:** W-71.
 
-### D-14 How replay treats sessions
-- **Today:** replay rebuilds books and market data and tells no session anything. Orders from before the restart rest in the book and still belong to their clients, who can cancel them after logging in again (S-24).
-- **Decided, not yet built:** a restart is a disconnect of everyone. Once D-01 is built, the venue cancels every resting order after replay, by the same journaled command.
-- **Touches:** W-01, D-01.
-
 ### D-15 How much of planck the C library covers
 - **Today:** the matching engine only. One shard on the caller's thread: submit, cancel, read reports and market events, query the book.
 - **Alternative A:** add the journal, so a C or Python program can record a run and replay it.
@@ -115,6 +104,19 @@ of its own.
 - **For it:** a C++ program built with a different compiler or standard library could use the engine safely, which planck's own headers do not allow. **Against it:** nobody needs that yet, and it is a second interface to keep in step with the first.
 - **Leaning:** leave it out until something outside this repository wants to use the engine from C++.
 - **Touches:** W-90.
+
+### D-18 Letting a client keep its orders working while it is away
+- **Today:** no. Every client's resting orders are cancelled when its connection ends (S-27).
+- **Alternative:** a client says at login that its orders should stay. That is only safe once a returning client can be told everything that happened to them meanwhile, which needs report sequence numbers and recovery (W-04).
+- **Leaning:** offer it after step 3 of the plan, and never as the default.
+- **Touches:** W-04.
+
+### D-19 A limit on how many orders one session may have resting
+- **Today:** none. One session may fill the whole store, and closing it then cancels all of that in one command, during which the shard serves nobody else.
+- **Alternative A:** a limit per session, checked when an order comes to rest. A venue wants this as a risk control anyway.
+- **Alternative B:** spread a large close over several passes of the shard, a bounded number of cancels at a time, with other commands in between.
+- **Leaning:** A first. It bounds the stall and is useful in its own right. B only if the limit has to be large.
+- **Touches:** W-25.
 
 ## Settled
 
@@ -146,3 +148,7 @@ of its own.
 | S-24 | A session is not a connection. A session is a client's standing with the venue: its id is the client id, from 1 to 65,535, the same on every connection and across restarts, and it owns the orders. A connection is one TCP link. At most one connection speaks for a session at a time. | Orders must belong to something that survives a dropped line and a restart, or nobody can ever be given their orders or their reports back. Using the client id itself, and not a number looked up from it, means the journal says who owns what with no table to keep in step. It also removes the limit of 65,535 connections in a run. |
 | S-25 | A refused login is told why and then disconnected. A client that is not listed and a client with the wrong token get the same answer. | One try per connection, and a stranger cannot learn which client ids exist. |
 | S-26 | Journal format 2. A journal written before S-24 is refused at startup. | Its session numbers named connections, not clients, so it cannot say who owns the orders it would rebuild. |
+| S-27 | Cancel on disconnect. When a connection that had logged in ends, for any reason, the gateway tells every shard, and each shard cancels what that session has resting. The cancels go to the owner with reason Disconnected and onto the feed as deletes. It is a command like any other: ordered with the session's own commands, journaled, and never dropped. A session cannot log in again until every shard has been sent it. (Was D-01.) | A client that has lost its line cannot manage its orders, and a venue should not trade for someone who is not there. Making it a journaled command keeps replay exact, and ordering it after the session's last order means nothing that session sent can slip past it. |
+| S-28 | A venue that starts cancels every resting order. The gateway opens by telling each shard that all sessions are closed, as one journaled command, before it accepts a connection. (Was D-14.) | A restart is a disconnect of everyone. The journal still rebuilds the books first, so the feed shows each order leaving and subscribers stay in step. |
+| S-29 | The list of each session's resting orders is kept by the shard, beside the order store, and only in a shard asked to cancel on disconnect (`ShardConfig::cancel_on_disconnect`). `planckd` always asks. The book knows nothing of it. | The order stays at half a cache line and the book stays free of sessions. A shard that is not a venue, in a benchmark or behind the C interface, pays nothing. |
+| S-30 | Journal format 3: two more kinds of record, for one session closing and for all of them. Formats 1 and 2 are refused. | A format 2 reader would stop at the new records, and a format 2 journal was written by shards that kept orders, so it would rebuild books that this venue would never have had. |

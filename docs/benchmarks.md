@@ -33,7 +33,7 @@ it.
 | `--filter TEXT` | Run only benchmarks whose name contains TEXT. |
 | `--samples N` | Operations timed per benchmark. Default 1,000,000. |
 | `--cpu N` | Pin the measuring thread. |
-| `--cpu2 N` | Pin the second thread of the two-thread benchmarks, and let it spin. |
+| `--cpu2 N` | Pin the second thread of the two-thread benchmarks, and let it spin. Give this whenever you give `--cpu`, or those benchmarks crawl (W-87). |
 | `--csv` | Comma separated output, for scripts. |
 | `--quick` | A few thousand samples. Checks that everything runs. |
 
@@ -51,6 +51,7 @@ Every figure is nanoseconds for one operation.
 | `wire.decode_new_order` | What the gateway does to each request: find the frame, copy it out, check every field, build the command. |
 | `shard.rest`, `shard.cancel`, `shard.trade` | A whole command through a shard, on the measuring thread: off the command ring, clock read, match, replies encoded and put on the outgoing rings. `trade` is one order filling one other. |
 | `shard.*.journal` | The same with journaling on. The difference is all that journaling costs the matching thread. |
+| `shard.*.disconnect` | The same with cancel on disconnect on, as a venue runs. The difference is what keeping each session's list of resting orders costs. |
 | `shard_thread.*` | A shard on its own thread, as in the venue. From the moment a command is stamped to the moment its first report is read back, with one command in flight at a time. Two ring hops and the match. |
 
 ## planck-loadgen
@@ -64,7 +65,8 @@ It logs in `--sessions` connections and sends new orders. Most rest. A share
 set by `--cross` (10 percent by default) cross and trade. Each session
 cancels its oldest resting order once it holds more than `--depth`, so the
 book stays the same size for the whole run, and at the end everything left
-resting is cancelled. `--band-low`, `--band-ticks` and `--symbols` must
+resting is cancelled. (The venue would cancel it anyway when the sessions
+disconnect.) `--band-low`, `--band-ticks` and `--symbols` must
 match what `planckd` was started with.
 
 There are two ways to pace the load, and they answer different questions.
@@ -141,6 +143,10 @@ What can be read from them even so:
   shard takes about 85 ns. Most of the time on the matching path is spent
   around the book, not in it. See W-24.
 - Journaling adds nothing visible to the matching thread. See D-12.
+- Nor does cancel on disconnect, as far as this machine can tell: three
+  runs of `shard.cancel` gave medians of 121, 129 and 133 ns, and three of
+  `shard.cancel.disconnect` gave 85, 91 and 167. The rows are not in the
+  table for that reason. See W-88.
 - Crossing to another thread and back costs several times what the match
   does. On two shared CPUs that figure is mostly the machine.
 

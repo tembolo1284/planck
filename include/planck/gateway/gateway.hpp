@@ -72,6 +72,12 @@ struct GatewayStats {
     std::uint64_t busy = 0;
     // Logins refused because the client is not listed or its token is wrong.
     std::uint64_t bad_credentials = 0;
+    // Times a shard was told that a session had lost its connection. One
+    // for each shard for each logged-in connection that ended.
+    std::uint64_t session_closes = 0;
+    // Subset of session_closes that could not be sent at once, because the
+    // shard's command ring was full, and went out on a later pass.
+    std::uint64_t session_closes_delayed = 0;
     // Reports for a session that had no connection at the time.
     std::uint64_t reports_dropped = 0;
     // Connections dropped for sending bytes that are not the protocol.
@@ -96,10 +102,18 @@ struct GatewayStats {
 // A connection is one TCP link, here today and gone tomorrow. At most one
 // connection speaks for a session at a time.
 //
-// So a client that reconnects is the same owner as before: it can cancel
-// the orders it left and it receives their fills from then on. Reports
-// produced while it had no connection are dropped and counted. Orders stay
-// in the book while their owner is away.
+// When a connection that had logged in ends, for whatever reason, the
+// gateway tells every shard that the session has closed, and a shard that
+// is configured to cancel on disconnect then cancels what the session had
+// resting. When the gateway itself starts it tells every shard that all
+// sessions are closed, because none of them has a connection yet. Like
+// every other command these are never dropped: one that does not fit in a
+// shard's ring is owed, and sent on a later pass. While a session is owed a
+// close it cannot log in again, or the late close would cancel the orders
+// of its new connection.
+//
+// A client that reconnects is the same owner as before. Reports produced
+// while it had no connection are dropped and counted.
 //
 // Lifecycle matches Shard: construct anywhere, init() on the thread that
 // will run it, then run() or poll().
@@ -163,6 +177,11 @@ private:
         return (slot == kNoConnection) ? nullptr : &connections_[slot];
     }
 
+    // Tell every shard that a session has lost its connection.
+    void close_session(core::SessionId session) noexcept;
+    // Send the closes that did not fit earlier.
+    void send_owed_closes() noexcept;
+
     // A free slot, or nullptr if every one is taken.
     [[nodiscard]] Connection* free_slot() noexcept;
 
@@ -214,6 +233,12 @@ private:
     std::array<Connection, kSlots> connections_{};
     // Slot of the connection speaking for each session id, or kNoConnection.
     std::array<std::uint16_t, kSessionIds> slot_by_session_{};
+    // For each session id, the shards still to be told that it has closed:
+    // one bit per index into shards_. And the sessions that have any.
+    std::array<std::uint16_t, kSessionIds> close_owed_{};
+    std::array<std::uint16_t, kSessionIds> owed_sessions_{};
+    std::size_t owed_count_ = 0;
+    static_assert(core::kMaxShards <= 16);
     mem::Arena arena_{};
 };
 

@@ -77,6 +77,10 @@ std::size_t arena_bytes(const ShardConfig& config) noexcept {
     total += std::size_t{config.report_ring_capacity} * sizeof(Report);
     total += std::size_t{config.market_ring_capacity} * sizeof(MarketEvent);
     total += std::size_t{config.journal_ring_capacity} * sizeof(JournalEntry);
+    if (config.cancel_on_disconnect) {
+        total += std::size_t{config.order_capacity} * (2 * sizeof(mem::Index));
+        total += (std::size_t{1} << 16) * sizeof(mem::Index);
+    }
     total += config.symbols.size() * sizeof(book::OrderBook);
     for (const SymbolConfig& symbol : config.symbols) {
         // One Level per tick, plus one bit per tick in each of two bitmaps.
@@ -163,6 +167,17 @@ Status Shard::init_memory(const ShardConfig& config) noexcept {
         }
         journaling_ = true;
     }
+    if (config.cancel_on_disconnect) {
+        const auto links = arena_.allocate_array<OwnerLink>(config.order_capacity);
+        const auto heads = arena_.allocate_array<mem::Index>(kOwners);
+        if (links.empty() || heads.empty()) {
+            return Status::Capacity;
+        }
+        std::fill(links.begin(), links.end(), OwnerLink{});
+        std::fill(heads.begin(), heads.end(), mem::kNullIndex);
+        owner_links_ = links.data();
+        owner_heads_ = heads.data();
+    }
     return market_.init(market);
 }
 
@@ -207,9 +222,10 @@ std::size_t Shard::poll(std::size_t max_commands) noexcept {
 
     std::size_t handled = 0;
     while (handled < max_commands) {
-        // Publish the previous command's messages before taking another. If
-        // a consumer is behind, stop here and let the backlog show upstream.
-        if (!try_flush()) {
+        // Finish the previous command and publish its messages before
+        // taking another. If a consumer is behind, stop here and let the
+        // backlog show upstream.
+        if (!try_finish()) {
             ++stats_.stalls;
             break;
         }
@@ -220,7 +236,7 @@ std::size_t Shard::poll(std::size_t max_commands) noexcept {
         handle(command, 0);
         ++handled;
     }
-    static_cast<void>(try_flush());
+    static_cast<void>(try_finish());
     if (handled == 0) {
         refresh_clock();
     }
@@ -240,19 +256,33 @@ void Shard::run(const std::atomic<bool>& stop) noexcept {
 bool Shard::try_replay(const Command& command, std::uint64_t timestamp_ns) noexcept {
     PLANCK_EXPECT(initialised());
     PLANCK_EXPECT(timestamp_ns != 0);
-    if (!try_flush()) {
+    if (!try_finish()) {
         ++stats_.stalls;
         return false;
     }
     replaying_ = true;
     handle(command, timestamp_ns);
     replaying_ = false;
-    static_cast<void>(try_flush());
+    static_cast<void>(try_finish());
     return true;
+}
+
+bool Shard::try_finish() noexcept {
+    PLANCK_EXPECT(initialised());
+    // Each pass with a close in progress cancels at least one order, so the
+    // store's capacity bounds the loop.
+    while (try_flush()) {
+        if (!closing()) {
+            return true;
+        }
+        continue_close();
+    }
+    return false;
 }
 
 void Shard::handle(const Command& command, std::uint64_t forced_timestamp_ns) noexcept {
     PLANCK_EXPECT(report_count_ == 0 && market_count_ == 0 && !journal_pending_);
+    PLANCK_EXPECT(!closing());
 
     ++stats_.commands;
     ++sequence_;
@@ -276,11 +306,22 @@ void Shard::handle(const Command& command, std::uint64_t forced_timestamp_ns) no
                      .session = command.session,
                      .accepted = false};
 
-    if (command.kind == CommandKind::NewOrder) {
-        handle_new(command);
-    } else {
-        PLANCK_ASSERT(command.kind == CommandKind::CancelOrder);
-        handle_cancel(command);
+    switch (command.kind) {
+        case CommandKind::NewOrder:
+            handle_new(command);
+            break;
+        case CommandKind::CancelOrder:
+            handle_cancel(command);
+            break;
+        case CommandKind::SessionClosed:
+            ++stats_.session_closes;
+            begin_close(command.session.raw(), 1);
+            break;
+        case CommandKind::AllSessionsClosed:
+            ++stats_.session_closes;
+            // In order of session id, so that a replay does the same.
+            begin_close(0, kOwners);
+            break;
     }
 }
 
@@ -326,6 +367,7 @@ void Shard::handle_new(const Command& command) noexcept {
         message.qty = result.resting.raw();
         message.timestamp = active_.now_ns;
         publish(message);
+        link_owner(slot_of(result.id), command.session.raw());
         return;
     }
 
@@ -360,6 +402,7 @@ void Shard::handle_cancel(const Command& command) noexcept {
     PLANCK_ASSERT(book != nullptr);
     const book::CancelResult result = book->cancel(id);
     PLANCK_ASSERT(result.reject == book::RejectReason::None);
+    unlink_owner(slot, command.session.raw());
 
     wire::Canceled canceled{};
     canceled.reason = wire::CancelReason::UserRequested;
@@ -376,8 +419,81 @@ void Shard::handle_cancel(const Command& command) noexcept {
     ++stats_.cancels;
 }
 
+void Shard::begin_close(std::size_t first_owner, std::size_t owners) noexcept {
+    PLANCK_EXPECT(!closing());
+    PLANCK_EXPECT(owners >= 1 && first_owner + owners <= kOwners);
+    if (owner_heads_ == nullptr) {
+        return;
+    }
+    close_owner_ = static_cast<std::uint32_t>(first_owner);
+    close_owners_left_ = static_cast<std::uint32_t>(owners);
+    close_slot_ = owner_heads_[first_owner];
+    close_replayed_ = replaying_;
+    continue_close();
+}
+
+void Shard::continue_close() noexcept {
+    PLANCK_EXPECT(closing());
+
+    // What is left of the close reports, or does not, as its start did.
+    const bool was_replaying = replaying_;
+    replaying_ = close_replayed_;
+    std::uint64_t cancelled = 0;
+
+    // Each pass cancels an order or moves on to the next session, and stops
+    // while the stage still has room for one order's two messages. So this
+    // never has to wait for a consumer.
+    while (close_owners_left_ != 0 && report_count_ < kStageCapacity &&
+           market_count_ < kStageCapacity) {
+        if (close_slot_ == mem::kNullIndex) {
+            // This session is done. Its list was walked from the head, newest
+            // order first, and every order on it has left the book.
+            owner_heads_[close_owner_] = mem::kNullIndex;
+            --close_owners_left_;
+            if (close_owners_left_ != 0) {
+                ++close_owner_;
+                close_slot_ = owner_heads_[close_owner_];
+            }
+            continue;
+        }
+        const mem::Index slot = close_slot_;
+        const core::SessionId session{static_cast<std::uint16_t>(close_owner_)};
+        const core::OrderId id = store_[slot].id;
+        const core::SymbolId symbol = store_[slot].symbol;
+        PLANCK_ASSERT(id != core::kNoOrderId && store_[slot].owner == close_owner_);
+        close_slot_ = owner_links_[slot].next;
+
+        book::OrderBook* const book = find_book(symbol);
+        PLANCK_ASSERT(book != nullptr);
+        const book::CancelResult result = book->cancel(id);
+        PLANCK_ASSERT(result.reject == book::RejectReason::None);
+
+        // Its owner is told, although nobody may be listening: the gateway
+        // drops what it cannot deliver.
+        wire::Canceled canceled{};
+        canceled.reason = wire::CancelReason::Disconnected;
+        canceled.order_id = id.raw();
+        canceled.qty = result.cancelled.raw();
+        canceled.timestamp = active_.now_ns;
+        report(session, canceled);
+
+        wire::MdDeleted deleted{};
+        deleted.symbol_id = symbol.raw();
+        deleted.order_id = id.raw();
+        deleted.timestamp = active_.now_ns;
+        publish(deleted);
+
+        ++cancelled;
+    }
+    stats_.disconnect_cancels += cancelled;
+    replaying_ = was_replaying;
+}
+
 void Shard::on_trade(const book::Trade& trade) noexcept {
     PLANCK_EXPECT(active_.taker_left.raw() >= trade.qty.raw());
+    if (trade.resting_leaves == core::Qty{0}) {
+        unlink_owner(slot_of(trade.resting), trade.resting_owner);
+    }
 
     if (!active_.accepted) {
         emit_accepted(trade.aggressor);

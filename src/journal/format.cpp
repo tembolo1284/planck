@@ -86,7 +86,7 @@ bool decode(const Record& record, engine::JournalEntry& out) noexcept {
     const auto type = static_cast<core::OrderType>(record.type);
     const auto tif = static_cast<core::TimeInForce>(record.tif);
     const bool sane = record.sequence != 0 && record.timestamp_ns != 0 && record.reserved == 0 &&
-                      record.kind <= std::to_underlying(engine::CommandKind::CancelOrder) &&
+                      record.kind < engine::kCommandKindCount &&
                       core::is_valid(side) && core::is_valid(type) && core::is_valid(tif);
     if (!sane) {
         return false;
@@ -132,6 +132,7 @@ std::uint64_t fingerprint(const engine::ShardConfig& config) noexcept {
     hasher.add(kVersion);
     hasher.add(config.shard.raw());
     hasher.add(config.order_capacity);
+    hasher.add(config.cancel_on_disconnect ? 1U : 0U);
     hasher.add(config.symbols.size());
     for (const engine::SymbolConfig& symbol : config.symbols) {
         hasher.add(symbol.symbol.raw());

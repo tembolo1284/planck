@@ -19,7 +19,8 @@ inline constexpr std::array<engine::SymbolConfig, 2> kSymbols{{
 }};
 
 // A shard small enough to start instantly and to fill up in a test. It does
-// not pin, and it yields when idle, so it behaves on a shared machine.
+// not pin, and it yields when idle, so it behaves on a shared machine. It
+// cancels on disconnect, as a venue's shards do.
 inline engine::ShardConfig small_shard(std::uint32_t orders = 4096, std::uint32_t ring = 1U << 14) {
     engine::ShardConfig config;
     config.shard = core::ShardId{2};
@@ -28,6 +29,7 @@ inline engine::ShardConfig small_shard(std::uint32_t orders = 4096, std::uint32_
     config.command_ring_capacity = ring;
     config.report_ring_capacity = ring;
     config.market_ring_capacity = ring;
+    config.cancel_on_disconnect = true;
     config.huge_pages = sys::HugePages::Off;
     config.pin = false;
     config.idle = engine::IdlePolicy::Yield;
@@ -58,6 +60,10 @@ inline engine::Command cancel_order(std::uint16_t session, std::uint64_t order_i
     wire::CancelOrder message{};
     message.order_id = order_id;
     return engine::make_command(message, core::SessionId{session}, 0);
+}
+
+inline engine::Command session_closed(std::uint16_t session) {
+    return engine::make_session_closed(core::SessionId{session});
 }
 
 inline std::span<const std::byte> payload(const engine::Report& report) {

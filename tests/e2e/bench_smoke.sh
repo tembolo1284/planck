@@ -48,10 +48,11 @@ for row in book.add book.cancel book.match_1_fill book.match_10_fills \
            ring.push_pop ring.core_to_core wire.decode_new_order \
            shard.rest shard.cancel shard.trade \
            shard.rest.journal shard.cancel.journal shard.trade.journal \
+           shard.rest.disconnect shard.cancel.disconnect shard.trade.disconnect \
            shard_thread.rest shard_thread.cancel shard_thread.trade; do
     expect bench.log "^$row,3000," "benchmark $row is missing or short of samples"
 done
-[ "$(wc -l < "$work/bench.log")" -eq 18 ] || fail "expected a header and 17 rows"
+[ "$(wc -l < "$work/bench.log")" -eq 21 ] || fail "expected a header and 20 rows"
 
 "$bench/planck-bench" --quick --filter book.match > "$work/filter.log" 2>> "$work/bench-err.log" \
     || fail "planck-bench --filter failed"

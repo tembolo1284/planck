@@ -32,6 +32,14 @@ void print(const engine::JournalEntry& entry) noexcept {
     const engine::Command& c = entry.command;
     const auto sequence = static_cast<unsigned long long>(entry.sequence);
     const apps::ShortText time = apps::format_time(entry.timestamp_ns);
+    if (c.kind == engine::CommandKind::SessionClosed) {
+        std::printf("%llu %s session=%u closed\n", sequence, time.c_str(), c.session.raw());
+        return;
+    }
+    if (c.kind == engine::CommandKind::AllSessionsClosed) {
+        std::printf("%llu %s all sessions closed\n", sequence, time.c_str());
+        return;
+    }
     if (c.kind == engine::CommandKind::CancelOrder) {
         std::printf("%llu %s session=%u cancel order_id=%llu\n", sequence, time.c_str(),
                     c.session.raw(), static_cast<unsigned long long>(c.id));
@@ -89,6 +97,7 @@ int main(int argc, char** argv) {
 
     std::uint64_t new_orders = 0;
     std::uint64_t cancels = 0;
+    std::uint64_t closes = 0;
     std::uint64_t first_time = 0;
     std::uint64_t last_time = 0;
     engine::JournalEntry entry;
@@ -98,15 +107,27 @@ int main(int argc, char** argv) {
         if (dump) {
             print(entry);
         }
-        ((entry.command.kind == engine::CommandKind::NewOrder) ? new_orders : cancels) += 1;
+        switch (entry.command.kind) {
+            case engine::CommandKind::NewOrder:
+                ++new_orders;
+                break;
+            case engine::CommandKind::CancelOrder:
+                ++cancels;
+                break;
+            case engine::CommandKind::SessionClosed:
+            case engine::CommandKind::AllSessionsClosed:
+                ++closes;
+                break;
+        }
         first_time = (first_time == 0) ? entry.timestamp_ns : first_time;
         last_time = entry.timestamp_ns;
         status = reader->next(entry);
     }
 
-    std::printf("commands=%llu new_orders=%llu cancels=%llu first=%s last=%s\n",
+    std::printf("commands=%llu new_orders=%llu cancels=%llu closes=%llu first=%s last=%s\n",
                 static_cast<unsigned long long>(reader->last_sequence()),
                 static_cast<unsigned long long>(new_orders), static_cast<unsigned long long>(cancels),
+                static_cast<unsigned long long>(closes),
                 apps::format_time(first_time).c_str(), apps::format_time(last_time).c_str());
 
     if (status == Status::Closed) {

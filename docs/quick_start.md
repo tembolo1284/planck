@@ -29,7 +29,7 @@ sudo apt install g++ clang cmake ninja-build python3 python3-cffi
 ./build.sh test --checked
 ```
 
-This configures `build/gcc-checked/`, builds everything and runs 308 tests.
+This configures `build/gcc-checked/`, builds everything and runs 324 tests.
 It should end with `100% tests passed`. "checked" is an optimised build with
 every contract tested at run time, which is the right one for tests.
 
@@ -71,7 +71,8 @@ buy 1 4 1000
 ```
 
 Client 2 sees its order accepted and executed. Client 1 sees its resting
-order partly filled. Type `help` at either prompt for the commands:
+order partly filled. When a client leaves, whatever it still has resting is
+cancelled. Type `help` at either prompt for the commands:
 
 ```
 buy  SYMBOL QTY PRICE [day|ioc|fok]   limit order. PRICE is in ticks.
@@ -98,8 +99,11 @@ build/gcc-release/apps/planckd --feed 127.0.0.1:30001 --journal /tmp/planck-jour
 ```
 
 Trade as above, then kill the venue with `kill -9` and start it again with
-the same command. It prints `shard 0 replayed N commands` and the resting
-orders are back. See [operations.md](operations.md).
+the same command. It prints `shard 0 replayed N commands`: the books and the
+whole market data stream are rebuilt from the journal. Then every order
+that was resting is cancelled, because nobody is connected to a venue that
+has just started. `planck-mdtap --from-start` shows all of it. See
+[operations.md](operations.md).
 
 ## 6. Measure it
 
@@ -131,7 +135,7 @@ C program needs. `capi/tests/capi_smoke.c` is a complete example, and
 | `build/ holds an old build made without presets` | An older checkout built straight into `build/`. Run `rm -rf build`. |
 | `ninja is not installed` | Install Ninja. The presets use it. |
 | Configure hangs or fails fetching GoogleTest | No network. Install `libgtest-dev`, version 1.14 or later. |
-| 307 tests, not 308 | Python's `cffi` is not installed. Harmless. |
+| 323 tests, not 324 | Python's `cffi` is not installed. Harmless. |
 | `FeedMulticast` reported as skipped | This host does not route multicast. Harmless. |
 | `clang-asan` or `clang-tsan` fails to link | Clang's sanitizer runtime is missing. Install `libclang-rt-dev`. |
 | A test fails only when the machine is busy | Tell us. Several such bugs were real (F-04 to F-06 in weaknesses.md). |

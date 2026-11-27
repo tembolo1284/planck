@@ -50,6 +50,14 @@ struct ShardConfig {
     // puts a JournalEntry on journal() for every command it handles, and
     // something must drain that ring or the shard will stall.
     std::uint32_t journal_ring_capacity = 0;
+
+    // Cancel a session's resting orders when it loses its connection (a
+    // SessionClosed or AllSessionsClosed command). Off, those commands do
+    // nothing and orders rest until they trade or are cancelled by hand. On,
+    // the shard keeps a list of resting orders per session: eight bytes for
+    // every order of capacity, and two more memory touches when an order
+    // comes to rest or leaves the book. A venue wants this on.
+    bool cancel_on_disconnect = false;
     sys::HugePages huge_pages = sys::HugePages::Try;
 
     // Thread placement. With pin off, the other three are ignored.
@@ -70,6 +78,11 @@ struct ShardStats {
     std::uint64_t trades = 0;
     std::uint64_t cancels = 0;
     std::uint64_t cancel_rejects = 0;
+    // SessionClosed and AllSessionsClosed commands, whether or not this
+    // shard acts on them.
+    std::uint64_t session_closes = 0;
+    // Orders cancelled because their session lost its connection.
+    std::uint64_t disconnect_cancels = 0;
     // Times the shard had to wait because a consumer had not kept up.
     std::uint64_t stalls = 0;
 };
@@ -116,6 +129,11 @@ public:
     // If a consumer has fallen behind, poll() stops taking commands until it
     // catches up. The command ring then fills and the gateway sees
     // backpressure. No message is ever dropped.
+    //
+    // A session closing may cancel more orders than the stage holds too, but
+    // it never waits: it cancels a stage-full at a time, and if a consumer
+    // is behind, poll() returns with the rest still to do and carries on
+    // the next time it is called. No other command is taken in between.
     std::size_t poll(std::size_t max_commands = kDefaultPollBatch) noexcept;
 
     // Call poll() until stop becomes true. Idles as the config says.
@@ -127,11 +145,17 @@ public:
     // feed sees the same stream again. Nothing is reported to sessions,
     // which no longer exist, and nothing is journaled a second time.
     //
-    // Returns false, having done nothing, if output from an earlier command
-    // is still waiting for room in a ring. Let the consumers run and call
-    // again. Only the shard's own thread may call this, and never while a
-    // gateway is feeding commands().
+    // Returns false, without having started on this command, if an earlier
+    // one is not finished: its output is still waiting for room in a ring.
+    // Let the consumers run and call again. Only the shard's own thread may
+    // call this, and never while a gateway is feeding commands().
     [[nodiscard]] bool try_replay(const Command& command, std::uint64_t timestamp_ns) noexcept;
+
+    // Finish the last command as far as the rings allow: carry on with a
+    // close that is part way through and publish what is staged. True if
+    // nothing is left to do. After the last try_replay(), call this until
+    // it is: a close may still be in progress when try_replay() returns.
+    [[nodiscard]] bool try_finish() noexcept;
 
     // The gateway is the only producer on commands() and the only consumer
     // on reports(). The feed is the only consumer on market().
@@ -141,6 +165,7 @@ public:
     // The journal recorder is the only consumer on journal().
     [[nodiscard]] JournalRing& journal() noexcept { return journal_; }
     [[nodiscard]] bool journaling() const noexcept { return journaling_; }
+    [[nodiscard]] bool cancels_on_disconnect() const noexcept { return owner_links_ != nullptr; }
     // How many commands this shard has handled, replayed ones included. The
     // next JournalEntry will carry this plus one.
     [[nodiscard]] std::uint64_t sequence() const noexcept { return sequence_; }
@@ -171,7 +196,18 @@ private:
         bool accepted = false;
     };
 
+    // Where an order sits in its session's list of resting orders. Kept
+    // beside the order store, one per slot, so the Order itself stays at
+    // half a cache line.
+    struct OwnerLink {
+        mem::Index next = mem::kNullIndex;
+        mem::Index prev = mem::kNullIndex;
+    };
+
     static constexpr std::uint16_t kNoBook = 0xFFFF;
+    // One list head for every value a session id can take.
+    static constexpr std::size_t kOwners = std::size_t{1} << 16;
+    static_assert(sizeof(core::SessionId) == 2);
 
     [[nodiscard]] core::Status init_memory(const ShardConfig& config) noexcept;
     [[nodiscard]] core::Status init_books(const ShardConfig& config) noexcept;
@@ -188,6 +224,47 @@ private:
     void handle(const Command& command, std::uint64_t forced_timestamp_ns) noexcept;
     void handle_new(const Command& command) noexcept;
     void handle_cancel(const Command& command) noexcept;
+    // Start cancelling everything one session, or every session, has
+    // resting. Does nothing if this shard does not cancel on disconnect.
+    void begin_close(std::size_t first_owner, std::size_t owners) noexcept;
+    // Cancel as many more as the stage has room for. Ends the close when
+    // nothing is left.
+    void continue_close() noexcept;
+    [[nodiscard]] bool closing() const noexcept { return close_owners_left_ != 0; }
+
+    [[nodiscard]] static constexpr mem::Index slot_of(core::OrderId id) noexcept {
+        return static_cast<mem::Index>(id.raw() & book::OrderStore::kSlotMask);
+    }
+    // Keep the per-session lists in step with the book. Both do nothing if
+    // this shard does not cancel on disconnect.
+    void link_owner(mem::Index slot, std::uint32_t owner) noexcept {
+        if (owner_links_ == nullptr) {
+            return;
+        }
+        PLANCK_ASSERT(slot < store_.capacity() && owner < kOwners);
+        const mem::Index head = owner_heads_[owner];
+        owner_links_[slot] = OwnerLink{.next = head, .prev = mem::kNullIndex};
+        if (head != mem::kNullIndex) {
+            owner_links_[head].prev = slot;
+        }
+        owner_heads_[owner] = slot;
+    }
+    void unlink_owner(mem::Index slot, std::uint32_t owner) noexcept {
+        if (owner_links_ == nullptr) {
+            return;
+        }
+        PLANCK_ASSERT(slot < store_.capacity() && owner < kOwners);
+        const OwnerLink link = owner_links_[slot];
+        if (link.prev == mem::kNullIndex) {
+            PLANCK_ASSERT(owner_heads_[owner] == slot);
+            owner_heads_[owner] = link.next;
+        } else {
+            owner_links_[link.prev].next = link.next;
+        }
+        if (link.next != mem::kNullIndex) {
+            owner_links_[link.next].prev = link.prev;
+        }
+    }
     void on_trade(const book::Trade& trade) noexcept;
     void emit_accepted(core::OrderId id) noexcept;
 
@@ -209,6 +286,9 @@ private:
 
     // Hot state first.
     book::OrderBook* books_ = nullptr;
+    // Both null unless the shard cancels on disconnect.
+    OwnerLink* owner_links_ = nullptr;
+    mem::Index* owner_heads_ = nullptr;
     Active active_{};
     std::uint64_t match_sequence_ = 1;
     std::uint64_t shard_bits_ = 0;
@@ -218,6 +298,14 @@ private:
     bool journaling_ = false;
     // True while try_replay() is handling a command.
     bool replaying_ = false;
+    // A close in progress: the next order to cancel, the session whose list
+    // it is on, and how many sessions are still to go, this one included.
+    // Zero sessions to go means no close is in progress.
+    mem::Index close_slot_ = mem::kNullIndex;
+    std::uint32_t close_owner_ = 0;
+    std::uint32_t close_owners_left_ = 0;
+    // Whether the close came from try_replay(), which reports to nobody.
+    bool close_replayed_ = false;
     // One command makes one journal entry, and the next command is not
     // taken until it has gone out, so a stage of one is enough.
     bool journal_pending_ = false;

@@ -22,7 +22,7 @@ on real hardware yet, and several product decisions are still open. Read
 | Compilers | GCC 13 or later, Clang 18 or later |
 | Platform | Linux on x86-64. AArch64 paths exist and are untested. |
 | Build | CMake 3.25 or later with Ninja, driven by `./build.sh` |
-| Tests | 308, in ten build configurations |
+| Tests | 324, in ten build configurations |
 | Size | about 7,700 lines of library, 7,900 of tests |
 
 ## Quick start
@@ -116,9 +116,10 @@ next, and in what order, is the "Agreed plan" at the top of
 - **Durability is asynchronous.** A command is answered before it is on disk.
   A process crash loses nothing. A power cut can lose up to 10 ms (W-70,
   D-12).
-- **A disconnected client's orders stay in the book** until it comes back
-  for them. Cancel on disconnect is decided and next to be built (W-01,
-  D-01).
+- **Resting orders do not outlive a connection or a restart.** A client's
+  orders are cancelled when its connection ends, and every order is
+  cancelled when the venue starts (S-27, S-28). A line that dies without
+  closing is not noticed yet (W-03).
 - **The login token is sent in the clear.** `planckd --clients` says who may
   log in, and order entry must run over a private link (S-23, W-08).
 - **The feed has no snapshots.** A subscriber that falls too far behind

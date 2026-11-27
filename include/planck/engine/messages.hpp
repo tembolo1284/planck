@@ -15,7 +15,17 @@ namespace planck::engine {
 // What travels through the rings between a gateway, a shard and the feed.
 // All three types are fixed-size plain data.
 
-enum class CommandKind : std::uint8_t { NewOrder = 0, CancelOrder = 1 };
+enum class CommandKind : std::uint8_t {
+    NewOrder = 0,
+    CancelOrder = 1,
+    // A session has lost its connection. A shard configured to cancel on
+    // disconnect cancels every order of that session that is resting.
+    SessionClosed = 2,
+    // No session has a connection: order entry has just started. The same as
+    // SessionClosed for every session at once.
+    AllSessionsClosed = 3,
+};
+inline constexpr std::uint8_t kCommandKindCount = 4;
 
 // A request for a shard. The gateway builds one only from a wire message
 // that has passed wire::well_formed(), so the shard trusts every field.
@@ -60,6 +70,14 @@ static_assert(std::is_trivially_copyable_v<Command>);
                    .id = cancel.order_id,
                    .session = session,
                    .kind = CommandKind::CancelOrder};
+}
+
+[[nodiscard]] inline Command make_session_closed(core::SessionId session) noexcept {
+    return Command{.session = session, .kind = CommandKind::SessionClosed};
+}
+
+[[nodiscard]] inline Command make_all_sessions_closed() noexcept {
+    return Command{.kind = CommandKind::AllSessionsClosed};
 }
 
 // A command exactly as a shard carried it out, for the journal. Replaying

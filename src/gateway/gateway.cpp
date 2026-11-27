@@ -101,6 +101,15 @@ Status Gateway::init(const GatewayConfig& config) noexcept {
         return status;
     }
 
+    // Nobody is connected yet, whatever the shards remember from before a
+    // restart. The rings are empty and this is their only producer, so
+    // there is room.
+    for (engine::Shard* const shard : config.shards) {
+        if (!shard->commands().try_push(engine::make_all_sessions_closed())) {
+            return Status::Capacity;
+        }
+    }
+
     shards_ = config.shards;
     max_sessions_ = config.max_sessions;
     credentials_ = config.credentials;
@@ -135,6 +144,9 @@ std::size_t Gateway::poll() noexcept {
         }
     }
 
+    if (owed_count_ != 0) [[unlikely]] {
+        send_owed_closes();
+    }
     work += route_reports();
     flush_dirty();
     return work;
@@ -308,7 +320,10 @@ void Gateway::on_login(Connection& connection, const wire::LoginRequest& request
         rejected.reason = wire::LoginRejectReason::BadCredentials;
         ++stats_.bad_credentials;
         refused = true;
-    } else if (slot_by_session_[request.client_id] != kNoConnection) {
+    } else if (slot_by_session_[request.client_id] != kNoConnection ||
+               close_owed_[request.client_id] != 0) {
+        // Either it is connected, or the shards have not all heard that its
+        // last connection ended.
         rejected.reason = wire::LoginRejectReason::AlreadyLoggedIn;
         refused = true;
     }
@@ -486,10 +501,12 @@ void Gateway::disconnect(Connection& connection) noexcept {
     PLANCK_EXPECT(connection.open);
     PLANCK_EXPECT(active_ > 0);
 
-    // The session lives on without a connection. Its orders stay.
-    if (connection.session.raw() != 0) {
-        PLANCK_ASSERT(slot_by_session_[connection.session.raw()] == slot_of(connection));
-        slot_by_session_[connection.session.raw()] = kNoConnection;
+    // The session lives on without a connection, and the shards are told.
+    const core::SessionId session = connection.session;
+    if (session.raw() != 0) {
+        PLANCK_ASSERT(slot_by_session_[session.raw()] == slot_of(connection));
+        slot_by_session_[session.raw()] = kNoConnection;
+        close_session(session);
     }
     // The poller forgets a descriptor when it is closed, but say so anyway.
     static_cast<void>(poller_.remove(connection.socket));
@@ -502,6 +519,50 @@ void Gateway::disconnect(Connection& connection) noexcept {
     connection.tx_length = 0;
     --active_;
     ++stats_.disconnects;
+}
+
+void Gateway::close_session(core::SessionId session) noexcept {
+    PLANCK_EXPECT(session.raw() != 0);
+    PLANCK_EXPECT(close_owed_[session.raw()] == 0);
+
+    std::uint16_t owed = 0;
+    for (std::size_t i = 0; i < shards_.size(); ++i) {
+        ++stats_.session_closes;
+        if (!shards_[i]->commands().try_push(engine::make_session_closed(session))) {
+            owed = static_cast<std::uint16_t>(owed | (1U << i));
+            ++stats_.session_closes_delayed;
+        }
+    }
+    if (owed != 0) [[unlikely]] {
+        // A session is listed at most once: it cannot log in, and so cannot
+        // close again, until this is settled.
+        PLANCK_ASSERT(owed_count_ < owed_sessions_.size());
+        close_owed_[session.raw()] = owed;
+        owed_sessions_[owed_count_] = session.raw();
+        ++owed_count_;
+    }
+}
+
+void Gateway::send_owed_closes() noexcept {
+    std::size_t still_owed = 0;
+    for (std::size_t i = 0; i < owed_count_; ++i) {
+        const std::uint16_t session = owed_sessions_[i];
+        std::uint16_t owed = close_owed_[session];
+        for (std::size_t shard = 0; shard < shards_.size(); ++shard) {
+            const auto bit = static_cast<std::uint16_t>(1U << shard);
+            if ((owed & bit) != 0 &&
+                shards_[shard]->commands().try_push(
+                    engine::make_session_closed(core::SessionId{session}))) {
+                owed = static_cast<std::uint16_t>(owed & ~bit);
+            }
+        }
+        close_owed_[session] = owed;
+        if (owed != 0) {
+            owed_sessions_[still_owed] = session;
+            ++still_owed;
+        }
+    }
+    owed_count_ = still_owed;
 }
 
 void Gateway::idle() const noexcept {

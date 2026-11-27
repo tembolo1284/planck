@@ -51,11 +51,26 @@ An order or cancel before step 2 is answered with `OrderRejected` or
 echoed. The venue sends none of its own and never times a client out
 (W-03).
 
-A client that connects again is the same owner as before. It can cancel the
-orders it left resting, and it receives their fills from then on. Reports
-produced while it had no connection are not kept for it (W-01, W-04). Its
-orders stay in the book while it is away, until cancel on disconnect is
-built (D-01).
+**When a connection ends**, every order its session has resting is
+cancelled. It does not matter how it ends: a `Logout`, a close, a broken
+line the kernel has noticed, or the venue dropping the client for a
+protocol error or for not reading its reports. Each cancelled order is
+taken off the market data feed. A `Canceled` with reason 2 is produced for
+its owner too, but reports are not kept (W-04), so the owner sees it only
+if it has already connected again by then. Usually it has not. Orders the
+client had sent just before the end are carried out first and then
+cancelled like the rest.
+
+So a client that connects again is the same session, with nothing resting.
+It is not told what filled before the line dropped. A client that logs in
+again at once may be refused with "already logged in" for a moment, while
+the venue finishes closing its last connection: try again.
+
+A venue that restarts cancels every resting order before it accepts a
+connection (S-28).
+
+A line that dies without closing is not noticed, and those orders stay
+(W-03).
 
 The token is sent in the clear. Order entry belongs on a private link
 (S-23, W-08).
@@ -151,7 +166,7 @@ A venue with no room for another connection closes it without a message.
 
 | Offset | Size | Field | Meaning |
 |-------:|-----:|-------|---------|
-| 4 | 1 | `reason` | 0 you asked, 1 unfilled rest of an IOC or market order, 2 disconnected (defined, not sent today) |
+| 4 | 1 | `reason` | 0 you asked, 1 unfilled rest of an IOC or market order, 2 the session lost its connection |
 | 5 | 3 | reserved | |
 | 8 | 8 | `order_id` | |
 | 16 | 4 | `qty` | Quantity that was cancelled |
@@ -192,6 +207,7 @@ A venue with no room for another connection closes it without a message.
 | Anything refused | `OrderRejected` only |
 | Cancel of your resting order | `Canceled`, reason 0 |
 | Cancel of anything else | `CancelRejected`, reason 5 |
+| Nothing: your connection ends | `Canceled`, reason 2, for each order you had resting. You will rarely be there to read them. |
 
 The owner of a resting order that gets hit receives an `Executed` with
 liquidity 0, with no warning before it.
@@ -297,7 +313,7 @@ all the bytes of the header or record before the checksum field.
 | Offset | Size | Field | Meaning |
 |-------:|-----:|-------|---------|
 | 0 | 8 | `magic` | `PLNKJRNL` |
-| 8 | 4 | `version` | 2. Version 1 is refused (S-26). |
+| 8 | 4 | `version` | 3. Versions 1 and 2 are refused (S-26, S-30). |
 | 12 | 2 | `shard` | |
 | 14 | 2 | `header_bytes` | 64 |
 | 16 | 8 | `fingerprint` | Hash of the shard's configuration. Replay refuses a mismatch. |
@@ -318,12 +334,17 @@ One command, as the shard handled it.
 | 28 | 4 | `qty` | |
 | 32 | 2 | `symbol` | |
 | 34 | 2 | `session` | The owner: a client id |
-| 36 | 1 | `kind` | 0 new order, 1 cancel |
+| 36 | 1 | `kind` | 0 new order, 1 cancel, 2 session closed, 3 all sessions closed |
 | 37 | 1 | `side` | |
 | 38 | 1 | `type` | |
 | 39 | 1 | `tif` | |
 | 40 | 4 | reserved | |
 | 44 | 4 | `checksum` | |
+
+A "session closed" record uses only `session`, and "all sessions closed"
+uses none of the fields after the timestamp. The unused ones are zero.
+Neither says which orders were cancelled: replaying the journal up to that
+point shows what was resting.
 
 ### Reading one
 
@@ -340,7 +361,8 @@ for a torn tail, 4 for damage and 1 for unreadable.
 Any change to a layout here is a protocol change. The golden-bytes tests in
 `tests/unit/wire_test.cpp` will fail, on purpose. So is a change to what a
 field means, which no test can notice: that is why the journal went to
-version 2 when its session field changed meaning. Then:
+version 2 when its session field changed meaning. A new kind of record is
+a change too, and took it to version 3. Then:
 
 1. Bump `wire::kProtocolVersion` or `journal::kVersion`.
 2. Update the `static_assert`s, the golden bytes and this document together.

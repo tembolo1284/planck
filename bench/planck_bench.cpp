@@ -378,7 +378,10 @@ constexpr std::uint32_t kShardBand = 1U << 16;
 constexpr std::int32_t kShardMid = static_cast<std::int32_t>(kShardBand / 2);
 constexpr engine::SymbolConfig kShardSymbols[] = {{core::SymbolId{kSymbol}, core::Price{0}, kShardBand}};
 
-engine::ShardConfig shard_config(bool journaling) noexcept {
+// What a shard does besides matching.
+enum class Extra : std::uint8_t { None, Journal, CancelOnDisconnect };
+
+engine::ShardConfig shard_config(Extra extra) noexcept {
     engine::ShardConfig config;
     config.shard = core::ShardId{0};
     config.symbols = kShardSymbols;
@@ -386,7 +389,8 @@ engine::ShardConfig shard_config(bool journaling) noexcept {
     config.command_ring_capacity = 1U << 12;
     config.report_ring_capacity = 1U << 12;
     config.market_ring_capacity = 1U << 12;
-    config.journal_ring_capacity = journaling ? (1U << 12) : 0;
+    config.journal_ring_capacity = (extra == Extra::Journal) ? (1U << 12) : 0;
+    config.cancel_on_disconnect = (extra == Extra::CancelOnDisconnect);
     config.pin = false;
     return config;
 }
@@ -450,11 +454,13 @@ void drain(engine::Shard& shard, Outcome& outcome) noexcept {
 // for a command: take it off the ring, read the clock, match, encode the
 // replies and put them on the outgoing rings. With journaling on it also
 // covers handing the command to the journal ring, which is the whole cost
-// journaling adds to the matching thread.
-bool bench_shard_inline(const Context& context, bool journaling) {
+// journaling adds to the matching thread. With cancel on disconnect on it
+// covers keeping each session's list of resting orders. Every order here
+// belongs to one of two sessions, so the lists are as long as they can be.
+bool bench_shard_inline(const Context& context, Extra extra) {
     constexpr std::uint32_t kDepth = 1U << 13;
     const auto shard = std::make_unique<engine::Shard>();
-    if (!ok(shard->init(shard_config(journaling)))) {
+    if (!ok(shard->init(shard_config(extra)))) {
         return complain("shard: init failed");
     }
     Rng rng(5);
@@ -515,7 +521,9 @@ bool bench_shard_inline(const Context& context, bool journaling) {
         }
     }
 
-    const std::string_view suffix = journaling ? ".journal" : "";
+    const std::string_view suffix = (extra == Extra::Journal)              ? ".journal"
+                                    : (extra == Extra::CancelOnDisconnect) ? ".disconnect"
+                                                                           : "";
     char name[40];
     const auto row = [&](std::string_view what, const Histogram& histogram) {
         const int length = std::snprintf(name, sizeof(name), "shard.%.*s%.*s",
@@ -529,8 +537,13 @@ bool bench_shard_inline(const Context& context, bool journaling) {
     return true;
 }
 
-bool bench_shard(const Context& context) { return bench_shard_inline(context, false); }
-bool bench_shard_journal(const Context& context) { return bench_shard_inline(context, true); }
+bool bench_shard(const Context& context) { return bench_shard_inline(context, Extra::None); }
+bool bench_shard_journal(const Context& context) {
+    return bench_shard_inline(context, Extra::Journal);
+}
+bool bench_shard_disconnect(const Context& context) {
+    return bench_shard_inline(context, Extra::CancelOnDisconnect);
+}
 
 // A shard on a thread of its own, as in the venue. The measuring thread
 // plays the gateway: it stamps a command, pushes it, and spins on the report
@@ -544,7 +557,7 @@ bool bench_shard_thread(const Context& context) {
     std::atomic<bool> stop{false};
 
     std::thread thread([&] {
-        engine::ShardConfig config = shard_config(false);
+        engine::ShardConfig config = shard_config(Extra::None);
         config.pin = context.second_cpu_given;
         config.cpu = context.second_cpu;
         config.idle = context.second_cpu_given ? engine::IdlePolicy::Spin : engine::IdlePolicy::Yield;
@@ -649,6 +662,7 @@ constexpr Bench kBenches[] = {
     {"wire.decode", "frame, copy, validate and convert one NewOrder", bench_codec},
     {"shard.inline", "a whole command through a shard: rest, cancel, trade", bench_shard},
     {"shard.journal", "the same with journaling on", bench_shard_journal},
+    {"shard.disconnect", "the same with cancel on disconnect on", bench_shard_disconnect},
     {"shard.thread", "command in to report out across two threads", bench_shard_thread},
 };
 

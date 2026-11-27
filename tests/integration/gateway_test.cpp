@@ -55,8 +55,11 @@ protected:
         }
         engine::ShardConfig first = shard_config(2, kEquities);
         first.command_ring_capacity = command_ring;
+        first.cancel_on_disconnect = cancel_on_disconnect_;
+        engine::ShardConfig second = shard_config(5, kSpreads);
+        second.cancel_on_disconnect = cancel_on_disconnect_;
         ASSERT_EQ(shards_[0]->init(first), Status::Ok);
-        ASSERT_EQ(shards_[1]->init(shard_config(5, kSpreads)), Status::Ok);
+        ASSERT_EQ(shards_[1]->init(second), Status::Ok);
         pointers_ = {shards_[0].get(), shards_[1].get()};
 
         config.listen = {net::kLoopback, 0};
@@ -66,7 +69,24 @@ protected:
         gateway_ = std::make_unique<Gateway>();
         ASSERT_EQ(gateway_->init(config), Status::Ok);
         ASSERT_EQ(gateway_->local_endpoint(server_), Status::Ok);
+        // A gateway opens by telling every shard that nobody is connected.
+        // Let the shards take that in, so each test starts with empty rings.
+        for (auto& shard : shards_) {
+            ASSERT_EQ(shard->poll(), 1U);
+            ASSERT_EQ(shard->stats().session_closes, 1U);
+        }
     }
+
+    // Drive everything until the gateway has this many clients left.
+    void wait_until_nobody_is_connected_but(std::uint32_t remaining) {
+        for (int i = 0; i < 20'000 && gateway_->active_sessions() != remaining; ++i) {
+            pump();
+            ::usleep(100);
+        }
+        ASSERT_EQ(gateway_->active_sessions(), remaining);
+        pump();
+    }
+    void wait_until_nobody_is_connected() { wait_until_nobody_is_connected_but(0); }
 
     void pump() {
         static_cast<void>(gateway_->poll());
@@ -90,6 +110,9 @@ protected:
     std::unique_ptr<Gateway> gateway_;
     net::Endpoint server_{};
     bool shards_running_ = true;
+    // Most tests are about the gateway alone and leave orders where they
+    // lie. The ones about disconnects turn this on and start again.
+    bool cancel_on_disconnect_ = false;
 };
 
 TEST(GatewayConfigTest, RejectsBadConfigurations) {
@@ -452,7 +475,197 @@ TEST_F(GatewayTest, SessionLimitIsEnforced) {
     EXPECT_NE(fourth->login(4), 0);
 }
 
+TEST_F(GatewayTest, ADroppedConnectionCancelsItsOrdersInEveryShard) {
+    cancel_on_disconnect_ = true;
+    start({});
+    auto maker = client();
+    maker->login(1);
+    maker->send(limit(3, core::Side::Sell, 1000, 10, 1));
+    static_cast<void>(maker->expect<wire::OrderAccepted>());
+    maker->send(limit(700, core::Side::Sell, -50, 3, 2));
+    static_cast<void>(maker->expect<wire::OrderAccepted>());
+    const auto bystander = client();
+    bystander->login(2);
+    bystander->send(limit(3, core::Side::Sell, 1001, 4, 3));
+    static_cast<void>(bystander->expect<wire::OrderAccepted>());
+
+    maker->close();
+    wait_until_nobody_is_connected_but(1);
+    EXPECT_EQ(gateway_->stats().session_closes, 2U) << "one for each shard";
+    EXPECT_EQ(gateway_->stats().session_closes_delayed, 0U);
+    EXPECT_EQ(shards_[0]->stats().disconnect_cancels, 1U);
+    EXPECT_EQ(shards_[1]->stats().disconnect_cancels, 1U);
+    EXPECT_EQ(shards_[0]->store().in_use(), 1U) << "the bystander's order must stay";
+    EXPECT_EQ(shards_[1]->store().in_use(), 0U);
+    // The two cancellations were for a client that was no longer there.
+    EXPECT_EQ(gateway_->stats().reports_dropped, 2U);
+    EXPECT_TRUE(bystander->quiet()) << "one client was told about another's disconnect";
+
+    // Nothing is left to trade with at the maker's price.
+    bystander->send(limit(3, core::Side::Buy, 1000, 10, 4));
+    static_cast<void>(bystander->expect<wire::OrderAccepted>());
+    EXPECT_TRUE(bystander->quiet()) << "traded with an order that should have been cancelled";
+
+    // The maker comes back to the same session and an empty slate.
+    const auto returned = client();
+    EXPECT_EQ(returned->login(1), 1);
+    EXPECT_TRUE(returned->quiet());
+    returned->send(limit(3, core::Side::Sell, 1005, 1, 5));
+    EXPECT_EQ(returned->expect<wire::OrderAccepted>().client_order_id, 5U);
+}
+
+TEST_F(GatewayTest, AClientBackBeforeTheShardHasActedHearsItsOrdersCancelled) {
+    cancel_on_disconnect_ = true;
+    start({});
+    auto first = client();
+    first->login(1);
+    first->send(limit(3, core::Side::Sell, 1000, 10, 1));
+    const auto resting = first->expect<wire::OrderAccepted>();
+
+    // The shard falls behind. The connection ends and the close is queued
+    // for it, so nothing is owed and the client may come straight back.
+    shards_running_ = false;
+    first->close();
+    wait_until_nobody_is_connected();
+    ASSERT_EQ(gateway_->stats().session_closes_delayed, 0U);
+    const auto second = client();
+    ASSERT_EQ(second->login(1), 1);
+    second->send(limit(3, core::Side::Sell, 1001, 2, 2));
+
+    // The shard catches up: first the close, which takes the old order and
+    // tells the session, now connected again. Then the new order, which
+    // came after the close and must stay.
+    shards_running_ = true;
+    const auto canceled = second->expect<wire::Canceled>();
+    EXPECT_EQ(canceled.order_id, resting.order_id);
+    EXPECT_EQ(canceled.qty, 10U);
+    EXPECT_EQ(canceled.reason, wire::CancelReason::Disconnected);
+    EXPECT_EQ(second->expect<wire::OrderAccepted>().client_order_id, 2U);
+    EXPECT_TRUE(second->quiet());
+    EXPECT_EQ(shards_[0]->store().in_use(), 1U);
+    EXPECT_EQ(gateway_->stats().reports_dropped, 0U);
+}
+
+TEST_F(GatewayTest, EveryWayOfLeavingCancels) {
+    cancel_on_disconnect_ = true;
+    start({});
+    const auto resting_order = [](WireClient& who, std::uint32_t id) {
+        who.login(id);
+        who.send(limit(3, core::Side::Buy, 950, 1, id));
+        static_cast<void>(who.expect<wire::OrderAccepted>());
+    };
+
+    const auto polite = client();
+    resting_order(*polite, 1);
+    polite->send(wire::Logout{});
+    EXPECT_TRUE(polite->closed_by_server());
+
+    const auto vandal = client();
+    resting_order(*vandal, 2);
+    vandal->send(wire::OrderAccepted{});  // not a message a client may send
+    EXPECT_TRUE(vandal->closed_by_server());
+
+    auto vanished = client();
+    resting_order(*vanished, 3);
+    vanished->close();
+
+    wait_until_nobody_is_connected();
+    EXPECT_EQ(shards_[0]->stats().disconnect_cancels, 3U);
+    EXPECT_EQ(shards_[0]->store().in_use(), 0U);
+    EXPECT_EQ(gateway_->stats().session_closes, 6U);
+
+    // A connection that never logged in is no session and closes nothing.
+    auto nobody = client();
+    nobody->send(wire::Heartbeat{});
+    static_cast<void>(nobody->expect<wire::Heartbeat>());
+    nobody->close();
+    wait_until_nobody_is_connected();
+    const auto refused = client();
+    wire::LoginRequest bad{};
+    bad.client_id = 0;
+    refused->send(bad);
+    static_cast<void>(refused->expect<wire::LoginRejected>());
+    EXPECT_TRUE(refused->closed_by_server());
+    EXPECT_EQ(gateway_->stats().session_closes, 6U);
+}
+
+TEST_F(GatewayTest, ACloseThatDoesNotFitIsOwedAndTheSessionWaitsForIt) {
+    cancel_on_disconnect_ = true;
+    start({}, 4);  // shard 2 takes four commands and then is full
+    shards_running_ = false;
+
+    auto leaver = client();
+    leaver->login(1);
+    for (std::uint64_t i = 0; i < 4; ++i) {
+        leaver->send(limit(3, core::Side::Buy, 950, 1, i));
+    }
+    for (int i = 0; i < 50; ++i) {
+        pump();
+    }
+    ASSERT_EQ(gateway_->stats().commands_out, 4U);
+    leaver->close();
+    wait_until_nobody_is_connected();
+
+    // Shard 5 heard at once. Shard 2 has no room, so the gateway owes it.
+    EXPECT_EQ(gateway_->stats().session_closes, 2U);
+    EXPECT_EQ(gateway_->stats().session_closes_delayed, 1U);
+
+    // Until that is settled the session cannot come back: its four orders
+    // are still to rest, and the close that follows them would otherwise
+    // cancel whatever its new connection did in between.
+    const auto too_soon = client();
+    expect_refused(*too_soon, 1, 0, wire::LoginRejectReason::AlreadyLoggedIn);
+    const auto someone_else = client();
+    EXPECT_EQ(someone_else->login(2), 2) << "one session's backlog held up another";
+
+    // The shard runs, the four orders rest, the close arrives and takes them.
+    shards_running_ = true;
+    for (int i = 0; i < 50; ++i) {
+        pump();
+    }
+    EXPECT_EQ(shards_[0]->stats().accepted, 4U);
+    EXPECT_EQ(shards_[0]->stats().disconnect_cancels, 4U);
+    EXPECT_EQ(shards_[0]->store().in_use(), 0U);
+    EXPECT_EQ(shards_[0]->stats().session_closes, 2U) << "the close was sent more than once";
+
+    const auto back = client();
+    EXPECT_EQ(back->login(1), 1);
+    back->send(limit(3, core::Side::Buy, 950, 1, 9));
+    static_cast<void>(back->expect<wire::OrderAccepted>());
+    for (int i = 0; i < 50; ++i) {
+        pump();
+    }
+    EXPECT_EQ(shards_[0]->store().in_use(), 1U) << "a late close cancelled the new connection's order";
+}
+
+TEST_F(GatewayTest, AStartingGatewayClearsWhatAnEarlierOneLeft) {
+    cancel_on_disconnect_ = true;
+    start({});
+    const auto early = client();
+    early->login(1);
+    early->send(limit(3, core::Side::Buy, 950, 1, 1));
+    static_cast<void>(early->expect<wire::OrderAccepted>());
+    ASSERT_EQ(shards_[0]->store().in_use(), 1U);
+
+    // The gateway goes away without a word, as in a crash, and another
+    // takes its place in front of the same shards.
+    GatewayConfig config;
+    config.listen = {net::kLoopback, 0};
+    config.shards = pointers_;
+    config.routes = kRoutes;
+    gateway_ = std::make_unique<Gateway>();
+    ASSERT_EQ(gateway_->init(config), Status::Ok);
+    for (auto& shard : shards_) {
+        static_cast<void>(shard->poll());
+    }
+    EXPECT_EQ(shards_[0]->store().in_use(), 0U);
+    EXPECT_EQ(shards_[0]->stats().disconnect_cancels, 1U);
+    EXPECT_EQ(shards_[0]->stats().session_closes, 2U);
+}
+
 TEST_F(GatewayTest, AReconnectingClientIsTheSameOwner) {
+    // With shards that keep orders, which is not how a venue runs but shows
+    // that a session is its client id and nothing else.
     auto maker = client();
     ASSERT_EQ(maker->login(1), 1);
     maker->send(limit(3, core::Side::Sell, 1000, 10, 1));

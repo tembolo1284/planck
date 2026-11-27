@@ -110,6 +110,19 @@ TEST(JournalFormat, RecordsSurviveTheRoundTrip) {
     engine::JournalEntry back;
     ASSERT_TRUE(decode(encode(cancel), back));
     EXPECT_TRUE(same(cancel, back));
+
+    engine::JournalEntry closed = entry_of(10);
+    closed.command = test::session_closed(65'535);
+    ASSERT_TRUE(decode(encode(closed), back));
+    EXPECT_TRUE(same(closed, back));
+    EXPECT_EQ(back.command.kind, engine::CommandKind::SessionClosed);
+    EXPECT_EQ(back.command.session, core::SessionId{65'535});
+
+    engine::JournalEntry all_closed = entry_of(11);
+    all_closed.command = engine::make_all_sessions_closed();
+    ASSERT_TRUE(decode(encode(all_closed), back));
+    EXPECT_TRUE(same(all_closed, back));
+    EXPECT_EQ(back.command.kind, engine::CommandKind::AllSessionsClosed);
 }
 
 TEST(JournalFormat, DecodeRefusesAnythingAShardCouldNotHaveWritten) {
@@ -137,6 +150,9 @@ TEST(JournalFormat, DecodeRefusesAnythingAShardCouldNotHaveWritten) {
     bad.kind = 9;
     EXPECT_FALSE(decode(resealed(bad), out));
     bad = good;
+    bad.kind = engine::kCommandKindCount;
+    EXPECT_FALSE(decode(resealed(bad), out)) << "one past the last kind there is";
+    bad = good;
     bad.tif = 3;
     EXPECT_FALSE(decode(resealed(bad), out));
     bad = good;
@@ -163,8 +179,9 @@ TEST(JournalFormat, HeaderIsChecked) {
     bad = good;
     bad.fingerprint ^= 1;
     EXPECT_EQ(check_header(bad), Status::Protocol) << "checksum must cover the fingerprint";
-    // Older and newer formats alike. Version 1 gave sessions another meaning.
-    for (const std::uint32_t other : {std::uint32_t{1}, kVersion + 1}) {
+    // Older and newer formats alike. Version 1 gave sessions another meaning,
+    // and version 2 knew nothing of sessions closing.
+    for (const std::uint32_t other : {std::uint32_t{1}, std::uint32_t{2}, kVersion + 1}) {
         bad = make_header(kShard, kFingerprint, 123);
         bad.version = other;
         bad.checksum = crc32c({reinterpret_cast<const std::byte*>(&bad), sizeof(bad) - 4});
@@ -182,6 +199,11 @@ TEST(JournalFormat, FingerprintFollowsEverythingThatAffectsMatching) {
     EXPECT_NE(fingerprint(changed), reference);
     changed = base;
     changed.order_capacity = 8192;
+    EXPECT_NE(fingerprint(changed), reference);
+    // A journal with closes in it rebuilds different books in a shard that
+    // ignores them.
+    changed = base;
+    changed.cancel_on_disconnect = !base.cancel_on_disconnect;
     EXPECT_NE(fingerprint(changed), reference);
 
     static constexpr engine::SymbolConfig kWiderBand[] = {

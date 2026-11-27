@@ -70,6 +70,9 @@ constexpr char kUsage[] =
     "  --lock-memory              keep every page in RAM\n"
     "  --stats SECONDS            print counters this often, 0 for never (0)\n"
     "\n"
+    "A client's resting orders are cancelled when its connection ends, however it\n"
+    "ends. Every resting order is cancelled when the venue starts.\n"
+    "\n"
     "Stop it with Ctrl-C or SIGTERM.\n";
 
 enum class Idle : std::uint8_t { Spin, Yield, Sleep };
@@ -129,7 +132,8 @@ struct ShardRuntime {
     // Valid once recovery is Running.
     journal::ReplayResult replayed{};
     std::thread thread;
-    Counter commands, accepted, rejected, trades, cancels, cancel_rejects, stalls, resting;
+    Counter commands, accepted, rejected, trades, cancels, cancel_rejects, stalls, resting,
+        disconnect_cancels;
 
     void publish_stats() noexcept {
         const engine::ShardStats& s = shard.stats();
@@ -140,6 +144,7 @@ struct ShardRuntime {
         cancels.set(s.cancels);
         cancel_rejects.set(s.cancel_rejects);
         stalls.set(s.stalls);
+        disconnect_cancels.set(s.disconnect_cancels);
         resting.set(shard.store().in_use());
     }
 };
@@ -151,7 +156,7 @@ struct GatewayRuntime {
     // Valid once state is Running.
     net::Endpoint endpoint{};
     Counter sessions, connections, logins, messages_in, rejected, busy, reports_out,
-        reports_dropped, protocol_errors, slow_consumers, bad_credentials;
+        reports_dropped, protocol_errors, slow_consumers, bad_credentials, session_closes;
 
     // Time from a request coming off the socket to its report being picked
     // up to send, in counter ticks. Only the gateway thread touches it.
@@ -190,6 +195,7 @@ struct GatewayRuntime {
         protocol_errors.set(s.protocol_errors);
         slow_consumers.set(s.slow_consumers);
         bad_credentials.set(s.bad_credentials);
+        session_closes.set(s.session_closes);
     }
 };
 
@@ -308,6 +314,8 @@ void shard_main(Venue& venue, const Options& options, std::size_t index,
     config.order_capacity = options.orders;
     config.huge_pages = options.huge;
     config.journal_ring_capacity = options.journaling() ? (1U << 16) : 0;
+    // A venue never leaves a client's orders working behind its back.
+    config.cancel_on_disconnect = true;
     config.pin = options.pin;
     config.cpu = options.cpus[index];
     if (const Status status = runtime.shard.init(config); !ok(status)) {
@@ -432,6 +440,7 @@ void print_stats(const Venue& venue, std::uint32_t shards) noexcept {
     std::uint64_t rejected = 0;
     std::uint64_t trades = 0;
     std::uint64_t cancels = 0;
+    std::uint64_t disconnect_cancels = 0;
     std::uint64_t resting = 0;
     std::uint64_t stalls = 0;
     for (std::uint32_t i = 0; i < shards; ++i) {
@@ -441,21 +450,23 @@ void print_stats(const Venue& venue, std::uint32_t shards) noexcept {
         rejected += shard.rejected.get() + shard.cancel_rejects.get();
         trades += shard.trades.get();
         cancels += shard.cancels.get();
+        disconnect_cancels += shard.disconnect_cancels.get();
         resting += shard.resting.get();
         stalls += shard.stalls.get();
     }
     const GatewayRuntime& g = venue.gateway;
     const PublisherRuntime& p = venue.publisher;
     std::printf("stats engine commands=%llu accepted=%llu rejected=%llu trades=%llu cancels=%llu "
-                "resting=%llu stalls=%llu\n",
+                "disconnect_cancels=%llu resting=%llu stalls=%llu\n",
                 static_cast<unsigned long long>(commands),
                 static_cast<unsigned long long>(accepted),
                 static_cast<unsigned long long>(rejected), static_cast<unsigned long long>(trades),
-                static_cast<unsigned long long>(cancels), static_cast<unsigned long long>(resting),
-                static_cast<unsigned long long>(stalls));
+                static_cast<unsigned long long>(cancels),
+                static_cast<unsigned long long>(disconnect_cancels),
+                static_cast<unsigned long long>(resting), static_cast<unsigned long long>(stalls));
     std::printf("stats gateway sessions=%llu connections=%llu logins=%llu messages=%llu "
                 "rejected=%llu busy=%llu reports=%llu dropped=%llu protocol_errors=%llu "
-                "slow_consumers=%llu bad_credentials=%llu\n",
+                "slow_consumers=%llu bad_credentials=%llu session_closes=%llu\n",
                 static_cast<unsigned long long>(g.sessions.get()),
                 static_cast<unsigned long long>(g.connections.get()),
                 static_cast<unsigned long long>(g.logins.get()),
@@ -466,7 +477,8 @@ void print_stats(const Venue& venue, std::uint32_t shards) noexcept {
                 static_cast<unsigned long long>(g.reports_dropped.get()),
                 static_cast<unsigned long long>(g.protocol_errors.get()),
                 static_cast<unsigned long long>(g.slow_consumers.get()),
-                static_cast<unsigned long long>(g.bad_credentials.get()));
+                static_cast<unsigned long long>(g.bad_credentials.get()),
+                static_cast<unsigned long long>(g.session_closes.get()));
     std::printf("stats feed messages=%llu datagrams=%llu heartbeats=%llu send_failures=%llu "
                 "retransmit_requests=%llu retransmitted=%llu refused=%llu\n",
                 static_cast<unsigned long long>(p.messages.get()),

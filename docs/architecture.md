@@ -211,14 +211,40 @@ what travels on the rings.
   asked, maps and prefaults memory, builds the books and calibrates the
   clock.
 - **`poll()`** handles up to 64 commands. It never blocks, with one
-  exception: a single order whose output exceeds the 128-entry stage while a
-  consumer's ring is full has to wait for room, because fills already
-  reported cannot be undone.
+  exception: a single command whose output exceeds the 128-entry stage while
+  a consumer's ring is full has to wait for room, because fills already
+  reported cannot be undone. An order that sweeps many others does that.
+- **`try_finish()`** carries on with a command that could not be finished
+  in one go. Only a close can be like that. `poll()` calls it before taking
+  each command.
 - **`run()`** calls `poll()` until told to stop, spinning or yielding when
   idle.
 - **`try_replay()`** carries out one journaled command with its original
   timestamp. It publishes market data as usual, reports to nobody, and does
   not journal again.
+
+**Commands.** Four kinds: a new order, a cancel, one session closed, all
+sessions closed. The last two come from the gateway, never from a client.
+
+**Cancel on disconnect** (S-27, S-29). A shard asked for it
+(`ShardConfig::cancel_on_disconnect`, which `planckd` always sets) keeps a
+doubly linked list of resting orders for every session: two indices per
+order slot in an array beside the order store, and a head per session id.
+The shard links an order when it comes to rest and unlinks it when it is
+cancelled or filled in full. The book knows nothing of this. When a session
+closes, the shard walks its list, newest first, and cancels each order
+through the book as if asked to: a `Canceled` with reason Disconnected for
+the owner and an `MdDeleted` for the feed. "All sessions closed" does that
+for every session id in turn. A shard not asked for it treats both commands
+as no-ops, though it still counts and journals them.
+
+A close can cancel far more orders than the stage holds, and unlike a sweep
+it can stop anywhere. So it never waits: it cancels a stage-full, publishes,
+and carries on, and if a ring is full `poll()` returns with the close
+unfinished and resumes on the next call. No other command is taken until it
+is done, and every cancel carries the one timestamp of the command, so the
+outcome is the same however often it was interrupted. That matters to
+replay, and to anything that drives a shard on a single thread (W-25).
 
 **Backpressure.** If the report, market or journal ring is full, the shard
 stops taking commands. Its command ring then fills, and the gateway starts
@@ -255,8 +281,14 @@ One thread that owns every client connection.
   in the shard and in the journal. A connection is one TCP link in one of
   1024 slots. A table maps each session id to the slot of the connection
   speaking for it, if any. That table is how a report finds its way out,
-  and a report whose session has no connection is dropped and counted
-  (W-01).
+  and a report whose session has no connection is dropped and counted.
+- **Disconnects** (S-27). When a connection that had logged in ends, the
+  gateway pushes a "session closed" command to every shard, behind whatever
+  that session had already sent. If a shard's ring is full the close is
+  owed and goes out on a later pass, and until then that session may not
+  log in again, or the late close would cancel its new orders. When the
+  gateway itself starts, it pushes "all sessions closed" to every shard
+  (S-28).
 - **Buffers.** 4096 bytes in and 64 KiB out per session, all preallocated.
 - **Slow clients.** A client whose out buffer fills is disconnected. Holding
   its backlog would mean unbounded memory or stalling everyone (D-03).
@@ -335,8 +367,9 @@ Order matters, and `apps/planckd.cpp` is the reference.
 3. Each shard replays its journal, if there is one, on its own thread.
 4. The recorder starts. It checks that each journal's next sequence number
    is the one its shard will produce.
-5. The gateway starts. The orders the journals rebuilt belong to the same
-   client ids as before, so there is nothing to carry over (S-24).
+5. The gateway starts. Its first act is to tell every shard that all
+   sessions are closed, which cancels every order the journals rebuilt
+   (S-28). Those cancels are journaled and go out on the feed.
 6. `ready` is printed.
 
 **Stop** (SIGINT or SIGTERM): shards first, then the gateway and publisher,
@@ -368,8 +401,10 @@ when the shards stop get no answer (W-61).
 A few open decisions would reach across modules if taken. Know about them
 before designing on top of the current shape.
 
-- **Cancel on disconnect (D-01)**, decided and next, needs the shard to
-  track live orders per session, and a new command kind that is journaled.
+- **Keeping orders through a disconnect (D-18)** needs report recovery
+  first, so a returning client can learn what happened to them.
+- **A limit on resting orders per session (D-19)** is a check where an
+  order comes to rest, and a counter beside each session's list.
 - **Group commit (D-12)** means holding reports until the sync that covers
   them: a path from recorder back to gateway.
 - **Feed snapshots (D-05)** and **journal snapshots (W-72)** are the same

@@ -151,7 +151,11 @@ where it is weakest, and what is next. Ids point into
 - **Safety net:** `shard_audit_test.cpp` and `journal_replay_test.cpp`.
 - **Weakest:** W-24. About 70 of the 85 ns a command takes are spent around
   the book and have never been profiled. This is the next piece of
-  performance work. Also W-21 (a dead consumer aborts the process).
+  performance work. Also W-21 (a dead consumer aborts the process) and W-25
+  (one session closing can hold the shard for as long as it has orders).
+- **Know first:** each session's list of resting orders lives in the shard,
+  not the book (S-29). Anything that makes an order rest or leave the book
+  must keep it in step: see `link_owner` and `unlink_owner`.
 - **Rule:** anything that makes matching depend on something other than
   the command and its timestamp breaks replay. No wall-clock reads, no
   randomness, no dependence on ring fill levels.
@@ -170,10 +174,10 @@ where it is weakest, and what is next. Ids point into
   stall another.
 - **Know first:** a session is not a connection (S-24). Read the comment
   above `class Gateway` before anything else.
-- **Weakest:** this is where most of the agreed plan lands. D-01 cancel on
-  disconnect is next, then W-03 heartbeats and idle timeout and W-04 report
-  recovery. Also W-08 (the token is sent in the clear) and W-61 clean
-  shutdown.
+- **Weakest:** this is where most of the agreed plan lands. Next are W-03
+  heartbeats and an idle timeout, without which a dead line is never
+  noticed, and W-04 report recovery. Also W-08 (the token is sent in the
+  clear) and W-61 clean shutdown.
 - **Never tested:** slow-consumer disconnect (W-40), anything over a real
   network (W-86).
 
@@ -228,16 +232,15 @@ where it is weakest, and what is next. Ids point into
 ## What to do next, in order
 
 The order was agreed on 2026-11-26 and is kept as the "Agreed plan" at the
-top of [decisions.md](decisions.md). Step 1 is done. In short:
+top of [decisions.md](decisions.md). Steps 1 and 2 are done. In short:
 
-1. Cancel on disconnect and at restart (D-01, D-14).
-2. Heartbeats, report sequence numbers and recovery, idempotent orders
+1. Heartbeats, report sequence numbers and recovery, idempotent orders
    (W-03, W-04).
-3. A commit boundary for reports and market data, after measuring the time
+2. A commit boundary for reports and market data, after measuring the time
    to durable (D-12, D-13, W-80).
-4. Snapshots and a separate recovery service for the feed (D-05, W-10,
+3. Snapshots and a separate recovery service for the feed (D-05, W-10,
    W-11).
-5. A failed market data consumer must not stop matching (W-21).
+4. A failed market data consumer must not stop matching (W-21).
 
 Alongside, whenever there is hardware for it: measure on real machines
 (W-50), and profile the 70 ns around the book (W-24).

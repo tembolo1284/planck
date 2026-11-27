@@ -69,9 +69,9 @@ message names the line. At most 4,096 clients.
 
 - A client logs in with its id and token: `planck-client --client-id 17
   --token 18364758544493064720`. The token is decimal on the command line.
-- The client id is the session id. It owns the client's orders, on every
-  connection and across restarts, so do not hand a retired client's id to
-  someone new while its orders may still be in the book or the journal.
+- The client id is the session id. It owns the client's orders, and it is
+  how the journal names the client, so do not hand a retired client's id to
+  someone new if the journal should stay readable as a record.
 - The file is read once. Changing it means a restart (W-09).
 - Keep it readable by the venue's user only: `chmod 600`. Tokens are stored
   as written.
@@ -80,8 +80,8 @@ message names the line. At most 4,096 clients.
 **Without `--clients`** the venue prints `clients: anyone may log in` and
 means it. Any client id from 1 to 65,535 is accepted and the token is
 ignored. Anyone who can reach the port can log in as a client that is not
-connected, cancel its orders and receive its fills (W-05). That is right
-for tests, benchmarks and the demo, and for nothing else.
+connected and trade as that client (W-05). That is right for tests,
+benchmarks and the demo, and for nothing else.
 
 **The network.** The token is sent in the clear and is the same every time
 (W-08). It stops one client posing as another. It does not stop anyone who
@@ -90,6 +90,28 @@ strangers are not on: a private network, or a tunnel. For clients on home
 or office internet, put the venue and each client on a WireGuard network
 and have `planckd --listen` bind the venue's tunnel address, not `0.0.0.0`.
 Nothing in planck sets this up, and it has not been tried here (W-86).
+
+### Disconnects and restarts
+
+A venue never leaves a client's orders working behind its back (S-27).
+
+- When a connection that had logged in ends, however it ends, everything
+  that client has resting is cancelled, in every shard. The feed shows each
+  order leaving.
+- When the venue starts, everything is cancelled before the first client
+  can connect (S-28). With a journal the books are rebuilt first and then
+  emptied, so the feed shows that too.
+- A client that reconnects is the same session and starts with nothing
+  resting. It is not told what happened while it was away (W-04).
+
+There is no flag for this. Two limits to know:
+
+- A disconnect is noticed when the kernel reports the connection closed. A
+  line that goes dead without closing is not noticed, and those orders stay
+  (W-03).
+- All of a client's orders are cancelled in one go, and the shard does
+  nothing else meanwhile. A client with hundreds of thousands of orders
+  resting makes everyone on its shards wait when it leaves (W-25).
 
 ### Threads and CPUs
 
@@ -123,9 +145,11 @@ None of this has been exercised in development (W-43, W-49).
 `--stats N` prints five lines every N seconds.
 
 ```
-stats engine  commands accepted rejected trades cancels resting stalls
+stats engine  commands accepted rejected trades cancels disconnect_cancels
+              resting stalls
 stats gateway sessions connections logins messages rejected busy reports
               dropped protocol_errors slow_consumers bad_credentials
+              session_closes
 stats feed    messages datagrams heartbeats send_failures retransmit_requests
               retransmitted refused
 stats latency reports p50_ns p99_ns p999_ns max_ns
@@ -138,7 +162,10 @@ What to watch:
 |---------|-----------------------------------|
 | `engine stalls` | A consumer of the shard's output is too slow. The shard waited. |
 | `gateway busy` | Orders were rejected because a command ring was full. The shard is the bottleneck. |
-| `gateway dropped` | Reports for clients that had no connection at the time. Expected after a disconnect (W-01). |
+| `engine disconnect_cancels` | Orders cancelled because their client's connection ended, or the venue started. Not included in `cancels`. |
+| `engine commands` | Counts sessions closing as well as orders and cancels. One per shard for each client that leaves, and one per shard at each start. |
+| `gateway dropped` | Reports for clients that had no connection at the time. Each order cancelled by a disconnect adds one. |
+| `gateway session_closes` | Times a shard was told that a client had gone: the number of shards for each logged-in connection that ended. |
 | `gateway bad_credentials` | Logins refused: not listed, or the wrong token. A steady climb is someone guessing. |
 | `gateway slow_consumers` | Clients disconnected for not reading their reports (D-03) |
 | `gateway protocol_errors` | Clients sent bytes that are not the protocol |
@@ -161,8 +188,12 @@ With `--journal DIR` the venue keeps one file per shard, `shard-NN.journal`.
 **At startup** each shard replays its file into an empty book before the
 venue accepts connections. Replay also republishes the whole market data
 stream from sequence 1 (W-73). Subscribers that were already listening
-ignore what they have seen. Restart time grows with the journal, since
-there are no snapshots (W-72).
+ignore what they have seen. Then every order that is resting is cancelled,
+which the feed shows and the journal records. Restart time grows with the
+journal, since there are no snapshots (W-72).
+
+The journal is what keeps the feed whole across a restart, and the record
+of what the venue did. It does not carry resting orders over: nothing does.
 
 **What survives what:**
 
@@ -177,7 +208,7 @@ there are no snapshots (W-72).
 | It reports | Cause | What to do |
 |--------------|-------|------------|
 | `InvalidArgument` while rebuilding a shard | `--shards`, `--symbols`, `--band-*` or `--orders` differ from the run that wrote it (W-74) | Use the old flags, or move the journal away and start empty |
-| `Unsupported` while rebuilding a shard | The journal is in an older format. Journals written before sessions became client ids are format 1, and this venue reads format 2 (S-26). | Move the journal away and start empty |
+| `Unsupported` while rebuilding a shard | The journal is in an older format. This venue reads format 3 only (S-26, S-30). | Move the journal away and start empty |
 | `Protocol` while rebuilding a shard | A bad record with good ones after it (S-13) | Inspect with `planck-replay`. Decide by hand. There is no repair tool. |
 
 **If the journal fails while running** (disk full or failing), `planckd`
@@ -189,11 +220,9 @@ venue.
 start again. There is no rotation.
 
 **Sessions:** after a restart, clients must log in again. Each is the same
-session as before, because a session id is a client id. Orders from before
-the restart still rest in the book and still belong to their clients, who
-can cancel them. Fills that happened while a client was away are not
-reported to it (W-01). Once cancel on disconnect is built, a restart will
-cancel every resting order (D-14).
+session as before, because a session id is a client id, and each finds
+that nothing of its rests any more. What filled before the venue went down
+is not reported again (W-04).
 
 ## The other programs
 
@@ -272,6 +301,6 @@ See [benchmarks.md](benchmarks.md).
 
 Before putting this in front of anyone, read the Gateway, Feed, Journal and
 Programs sections of [weaknesses.md](weaknesses.md). In short: a login
-token sent in the clear, no cancel on disconnect, no heartbeats or idle
-timeout, no feed snapshots, an unprotected retransmit port, asynchronous
+token sent in the clear, no heartbeats or idle timeout, so a dead line is
+not noticed, no report recovery, no feed snapshots, an unprotected retransmit port, asynchronous
 durability, no clean shutdown for clients, and no monitoring beyond stdout.
