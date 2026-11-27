@@ -85,9 +85,17 @@ def check_file(root, relative):
     return sorted(problems)
 
 
+def skipped(path, name):
+    """Directories that hold no source: the fixed names, anything hidden, and
+    any build tree, whatever it is called."""
+    return (name in SKIP_DIRECTORIES or name.startswith(".")
+            or os.path.exists(os.path.join(path, "CMakeCache.txt")))
+
+
 def files_under(root):
     for directory, names, files in os.walk(root):
-        names[:] = sorted(name for name in names if name not in SKIP_DIRECTORIES)
+        names[:] = sorted(name for name in names
+                          if not skipped(os.path.join(directory, name), name))
         for name in sorted(files):
             if name.endswith(TEXT) or name == "CMakeLists.txt":
                 yield os.path.relpath(os.path.join(directory, name), root)

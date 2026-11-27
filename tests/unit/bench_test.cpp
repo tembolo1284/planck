@@ -8,6 +8,7 @@
 
 #include "flow.hpp"
 #include "harness.hpp"
+#include "planck/sys/clock.hpp"
 
 namespace planck::bench {
 namespace {
@@ -130,10 +131,19 @@ TEST(BenchStopwatch, MeasuresRealTimeAndNeverGoesNegative) {
     EXPECT_EQ(watch->adjust(watch->overhead_ticks()), 0U);
     EXPECT_EQ(watch->adjust(watch->overhead_ticks() + 5), 5U);
 
+    // Compare with CLOCK_MONOTONIC_RAW, the clock the stopwatch is calibrated
+    // against, and not with the length of the sleep. The sleep runs on
+    // CLOCK_MONOTONIC, which some hosts (WSL2 among them) run at a visibly
+    // different rate. The stopwatch brackets the two kernel readings, so it
+    // can only have seen more time than they did.
     const std::uint64_t started = Stopwatch::start();
+    const std::uint64_t raw_before = sys::monotonic_now().raw();
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const std::uint64_t raw_after = sys::monotonic_now().raw();
     const double nanos = watch->to_nanos(watch->stop(started));
-    EXPECT_GE(nanos, 20e6);
+    const double raw_nanos = static_cast<double>(raw_after - raw_before);
+    EXPECT_GT(raw_nanos, 1e6) << "the sleep did not sleep";
+    EXPECT_GE(nanos, raw_nanos * 0.99) << "the stopwatch saw less time than the kernel did";
     EXPECT_LT(nanos, 2000e6);
 
     const std::uint64_t ticks = watch->from_nanos(1'000'000);
