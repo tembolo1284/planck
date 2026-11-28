@@ -6,6 +6,11 @@ source. The source of truth is `include/planck/wire/` and
 `include/planck/journal/format.hpp`, where `static_assert`s pin every size
 and offset given here.
 
+There are two implementations, and both are checked against the same
+bytes: the C++ one the venue runs, and a Rust one in `rust/planck-wire/`
+for programs that talk to the venue without linking any C++. See
+"Other languages" below.
+
 ## Common rules
 
 - Protocol version 3. A client that logs in with any other is refused.
@@ -463,16 +468,22 @@ for a torn tail, 4 for damage and 1 for unreadable.
 ## Changing the protocol
 
 Any change to a layout here is a protocol change. The golden-bytes tests in
-`tests/unit/wire_test.cpp` will fail, on purpose. So is a change to what a
+`tests/unit/wire_test.cpp` and the fixture files checked by
+`tests/unit/wire_fixture_test.cpp` will fail, on purpose. So is a change to what a
 field means, which no test can notice: that is why the journal went to
 version 2 when its session field changed meaning. A new kind of record is
 a change too, and took it to version 3. Then:
 
 1. Bump `wire::kProtocolVersion` or `journal::kVersion`.
 2. Update the `static_assert`s, the golden bytes and this document together.
-3. For the journal, decide what happens to old files. There is no migration
+3. For the wire protocol, make the same change in `rust/planck-wire/`: the
+   table in its `message!` declaration, `PROTOCOL_VERSION`, and the crate's
+   minor version, which is the protocol version. Then write the fixture
+   files again, into a new `tests/fixtures/wire/v<N>/`, and repeat the new
+   values in `rust/planck-wire/tests/golden.rs`. See "Other languages".
+4. For the journal, decide what happens to old files. There is no migration
    tool (W-74).
-4. If the C library's structs change, bump `PLANCK_ABI_VERSION` too.
+5. If the C library's structs change, bump `PLANCK_ABI_VERSION` too.
 
 The order entry protocol went to version 2 when heartbeats stopped being
 answered and `LoginAccepted` gained the idle timeout. The second of those
@@ -482,3 +493,75 @@ a correct client does, and that is a new version however small it looks.
 It went to version 3 when reports were numbered. `LoginRequest` and
 `LoginAccepted` both grew to 40 bytes, and a client order id stopped being
 the client's own business: the venue now reads it.
+
+## Other languages
+
+The protocol is the contract, not the C++ headers. A program in another
+language needs its own codec, and a way to know that codec is right.
+
+### The fixture files
+
+`tests/fixtures/wire/v3/` holds the protocol as bytes, in 18 files:
+
+| Files | What each holds |
+|-------|-----------------|
+| `login_request.bin` and 14 more, one per message | One message, every field set to a value that could not be mistaken for its neighbour |
+| `order_entry_stream.bin` | Five messages back to back, as a client reads them off a connection: `LoginAccepted`, `OrderAccepted`, `Executed`, `Heartbeat`, `Canceled` |
+| `md_packet.bin` | One datagram: a packet header with sequence 1000, then `MdAddOrder`, `MdExecuted` and `MdDeleted` |
+| `md_heartbeat.bin` | One datagram with no messages |
+
+`tests/unit/wire_fixture_test.cpp` builds each of them from the C++ structs
+on every test run and fails if a file differs. So the files are always what
+the venue really sends. A codec in any language that decodes every file to
+the right values, and encodes those values back to the same bytes, speaks
+the protocol.
+
+To write them again after a deliberate change:
+
+```bash
+PLANCK_WRITE_FIXTURES=1 build/gcc-checked/tests/planck_unit_tests \
+    --gtest_filter='WireFixtures.*'
+```
+
+The files are per protocol version. Keep the old directory when the
+version changes, so that a reader of old captures can still be tested.
+
+### Rust: `rust/planck-wire/`
+
+A crate with no dependencies and no `unsafe`. It is a codec and nothing
+more: no sockets, no sessions, no timers.
+
+| Rust | C++ |
+|------|-----|
+| `next_frame(buffer)` | `wire::next_frame` |
+| `T::decode(bytes)`, `T::encode(out)`, `T::to_bytes()` | `wire::decode<T>`, `wire::encode<T>` |
+| `VenueMessage::decode(frame)` | a `switch` on `frame.type` |
+| `Packet::parse(datagram)`, `packet.messages()` | the loop in `feed::Receiver` |
+| `MsgType::is_report()` | `wire::is_report` |
+
+Two differences from the C++ side, both on purpose:
+
+- **`decode` is the whole trust boundary.** In C++ `decode` checks the
+  shape and `well_formed` checks the values, and only for the three
+  messages a client sends. In Rust an enum cannot hold a value outside its
+  range, so `decode` checks every enum and every reserved byte of every
+  message, and there is no `well_formed`. A Rust program is therefore
+  stricter about what the venue sends it than the C++ client is.
+- **`Packet::parse` is all or nothing.** It decodes every message in a
+  datagram before it hands out the first, so a damaged datagram changes
+  nothing in the book being built.
+
+To use it from another repository:
+
+```toml
+[dependencies]
+planck-wire = { git = "https://github.com/tembolo1284/planck" }
+```
+
+Cargo finds the crate by name inside the repository. Pin a `rev` once a
+consumer depends on a particular protocol version.
+
+The crate's tests read the fixture files above, and one of them fails if
+the directory holds a file the suite has no test for. So a message added
+in C++ cannot be forgotten in Rust. They run as the `rust_wire` test
+wherever `cargo` is installed. See [testing.md](testing.md).

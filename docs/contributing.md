@@ -85,7 +85,7 @@ file, and no long dashes. Write short sentences and go easy on semicolons.
 |----------------|-----------|
 | A type every module needs | `core/` |
 | Anything that calls the kernel | `sys/` or `net/` |
-| A wire message | `wire/`, plus [protocol.md](protocol.md), plus golden bytes in `wire_test.cpp` |
+| A wire message | `wire/`, plus [protocol.md](protocol.md), plus golden bytes in `wire_test.cpp`, plus a fixture file and the same message in `rust/planck-wire/` |
 | A command a shard can execute | `engine/messages.hpp`, `Shard`, the journal's `Record`, `RandomFlow` and `FeedAuditor` in the tests |
 | A program | `apps/`, with its argument parsing in `apps/support.*` so it can be unit tested |
 | A benchmark | `bench/planck_bench.cpp`, one function and one line in the table |
@@ -166,6 +166,10 @@ where it is weakest, and what is next. Ids point into
 - **Promises:** `well_formed` is the only validation anyone does (S-09).
 - **Rule:** a new field or enum value needs its check in `well_formed`
   first. Everything behind the gateway trusts it blindly.
+- **Rule:** the Rust codec in `rust/planck-wire/` changes in the same
+  commit as the headers. The fixture files make forgetting it a test
+  failure on either side (S-36). Its code follows the same prose rules as
+  everything else, and `check_style.py` reads `.rs` and `.toml` too.
 
 ### net and gateway
 

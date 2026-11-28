@@ -73,3 +73,7 @@ Testing/
 # somewhere else, with a note of the machine they came from.
 /bench-results/
 __pycache__/
+# Cargo's output for the crates under rust/. They have no dependencies, so
+# there is no lock file worth keeping.
+/rust/*/target/
+/rust/*/Cargo.lock

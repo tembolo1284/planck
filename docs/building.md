@@ -113,6 +113,19 @@ core <- perf
 | `planck_capi` | shared library `libplanck.so` | `build/<cfg>/capi/` |
 | `planck_unit_tests`, `planck_property_tests`, `planck_integration_tests`, `planck_apps_tests`, `planck_bench_tests`, `planck_capi_tests`, `planck_capi_smoke` | test programs | `build/<cfg>/tests/`, `capi/` |
 
+`rust/planck-wire/` is not a CMake target. It is a Cargo crate with no
+dependencies, built and tested by `cargo` and by nothing else:
+
+```bash
+cargo build --manifest-path rust/planck-wire/Cargo.toml
+cargo test  --manifest-path rust/planck-wire/Cargo.toml
+```
+
+It needs Rust 1.85 or later. CMake looks for `cargo` and, if it is there,
+registers one test, `rust_wire`, that runs the crate's tests with their
+output under `build/<cfg>/rust-target/`. Without `cargo` everything else
+builds and tests exactly as before.
+
 Two things about `libplanck.so` are unusual and deliberate (S-17, S-18):
 
 - It compiles the engine's sources a second time, as position independent

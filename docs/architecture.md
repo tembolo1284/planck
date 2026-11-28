@@ -201,6 +201,11 @@ is in the struct is what is on the wire, and encode and decode are one
 `static_assert`s pin every size and offset, so an accidental layout change
 fails the build.
 
+The same protocol exists a second time, in Rust, as `rust/planck-wire/`.
+Nothing in the venue uses it. It is for programs outside this repository
+that read the feed or send orders. The two are held together by the files
+in `tests/fixtures/wire/`, which both test suites check (S-36).
+
 ### engine (`include/planck/engine/`)
 
 `Shard`: one matching thread and everything it owns. `messages.hpp` defines
@@ -376,10 +381,16 @@ the data. A power cut can lose up to one sync interval of commands that
 clients were already told about (W-70). If the disk fails, matching carries
 on and the journal stops being true (W-71, D-13).
 
-### apps, bench, capi
+### apps, bench, capi, rust
 
 Outside the library. See [operations.md](operations.md),
-[benchmarks.md](benchmarks.md) and [c_api.md](c_api.md).
+[benchmarks.md](benchmarks.md) and [c_api.md](c_api.md). For `rust/`, see
+"Other languages" in [protocol.md](protocol.md).
+
+There are now two ways in for another language, and they are for different
+jobs. `capi/` puts the matching engine inside your process: books, no
+network. `rust/planck-wire/` lets your process talk to a running venue
+over its sockets: network, no engine.
 
 ## Startup and shutdown in planckd
 

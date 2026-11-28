@@ -22,7 +22,7 @@ on real hardware yet, and several product decisions are still open. Read
 | Compilers | GCC 13 or later, Clang 18 or later |
 | Platform | Linux on x86-64. AArch64 paths exist and are untested. |
 | Build | CMake 3.25 or later with Ninja, driven by `./build.sh` |
-| Tests | 354, in ten build configurations |
+| Tests | 370, in ten build configurations |
 | Size | about 7,700 lines of library, 7,900 of tests |
 
 ## Quick start
@@ -44,6 +44,7 @@ src/              the library's sources, same layout
 apps/             planckd (the venue), planck-client, planck-mdtap, planck-replay
 bench/            planck-bench (in process) and planck-loadgen (over TCP)
 capi/             libplanck.so: the matching engine behind a C interface
+rust/             planck-wire: the wire protocol as a Rust crate, for clients
 tests/            unit, property, integration and end-to-end tests
 tools/            seeded-bug runner, benchmark comparison, style check
 scripts/          build matrix, benchmark runs, demo, host check
@@ -95,7 +96,7 @@ own four rings.
 | [building.md](docs/building.md) | Know every build option, configuration and target |
 | [testing.md](docs/testing.md) | Run tests, understand what they prove, add your own |
 | [architecture.md](docs/architecture.md) | Understand the design, module by module |
-| [protocol.md](docs/protocol.md) | Write a client, a feed handler or a journal reader |
+| [protocol.md](docs/protocol.md) | Write a client, a feed handler or a journal reader, in C++, Rust or anything else |
 | [operations.md](docs/operations.md) | Run the venue: flags, pinning, restart, counters |
 | [c_api.md](docs/c_api.md) | Use the engine from C, Python or anything with an FFI |
 | [benchmarks.md](docs/benchmarks.md) | Measure it, and read the numbers correctly |

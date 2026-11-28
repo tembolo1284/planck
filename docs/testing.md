@@ -1,6 +1,6 @@
 # Testing
 
-354 tests. This page says how to run them, what each group proves, and what
+370 tests. This page says how to run them, what each group proves, and what
 is expected of new code.
 
 ## Running
@@ -37,15 +37,25 @@ Each test has a label. `-L` selects by it.
 
 | Label | Count | What it is | Programs |
 |-------|------:|------------|----------|
-| `unit` | 226 | One module at a time, deterministic, fast | `planck_unit_tests`, `planck_apps_tests`, `planck_bench_tests` |
+| `unit` | 241 | One module at a time, deterministic, fast | `planck_unit_tests`, `planck_apps_tests`, `planck_bench_tests` |
 | `property` | 23 | Random runs against an independent model | `planck_property_tests` |
 | `integration` | 79 | More than one thread, or real sockets on loopback | `planck_integration_tests` |
 | `capi` | 21 | The C library, from C++, C and Python | `planck_capi_tests`, `planck_capi_smoke`, two scripts |
 | `e2e` | 2 | The programs as separate processes | `apps_smoke.sh`, `bench_smoke.sh` |
 | `tools` | 3 | The scripts and the house rules | `scripts_smoke.sh`, `check_style.py`, `test_tools.py` |
+| `rust` | 1 | The Rust codec, against the fixture files | `cargo test` in `rust/planck-wire/` |
 
-Sanitizer builds run 353, because the Python test of the C library is
-skipped there. So does a machine without Python's `cffi`.
+Sanitizer builds run 369, because the Python test of the C library is
+skipped there. So does a machine without Python's `cffi`. A machine without
+`cargo` runs one fewer again: `rust_wire` is not registered there.
+
+`rust_wire` is one CTest entry that runs 30 Rust tests. To see them one by
+one, or to run them without CMake:
+
+```bash
+cargo test --manifest-path rust/planck-wire/Cargo.toml
+cargo clippy --manifest-path rust/planck-wire/Cargo.toml --all-targets
+```
 
 ### unit (`tests/unit/`)
 
@@ -58,6 +68,7 @@ skipped there. So does a machine without Python's `cffi`.
 | `ladder_bitmap_test.cpp` | Finding the next occupied price level |
 | `order_book_test.cpp` | Every matching rule: priority, partial fills, IOC, FOK, market orders, bands, capacity, cancels |
 | `wire_test.cpp` | Every message: size, round trip, truncation, bad type, reserved bytes, plus golden bytes that pin the format |
+| `wire_fixture_test.cpp` | Every message, a stream of them and two datagrams, compared byte for byte with the files in `tests/fixtures/wire/`. The Rust tests read the same files. |
 | `shard_test.cpp` | A shard driven by hand: reports, market events, stalls, journaling, replay, sessions closing |
 | `net_test.cpp` | Address parsing, TCP and UDP sockets, the poller |
 | `perf_test.cpp` | Histogram buckets and percentiles |

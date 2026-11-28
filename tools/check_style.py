@@ -17,9 +17,10 @@ there were any.
 import os
 import sys
 
-TEXT = (".hpp", ".h", ".cpp", ".c", ".py", ".sh", ".md", ".txt", ".cmake", ".json", ".map")
+TEXT = (".hpp", ".h", ".cpp", ".c", ".py", ".sh", ".md", ".txt", ".cmake", ".json", ".map",
+        ".rs", ".toml")
 HEADERS = (".hpp", ".h")
-SKIP_DIRECTORIES = {"build", ".git", "bench-results", "__pycache__", "_deps"}
+SKIP_DIRECTORIES = {"build", ".git", "bench-results", "__pycache__", "_deps", "target"}
 # Built from their code points so that this file passes its own check.
 LONG_DASHES = {chr(0x2014): "em dash", chr(0x2013): "en dash"}
 
