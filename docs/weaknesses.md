@@ -1,24 +1,24 @@
 # Known weaknesses
- 
+
 Things that are wrong, missing, or unproven in planck today. Each entry says
 what the problem is, why it matters, and what a fix would look like. When one
 is fixed, move it to the "Fixed" list at the bottom with the date. Do not
 delete it.
- 
+
 Choices that could reasonably go either way live in `decisions.md`, not here.
- 
+
 Severity: **high** means wrong results or an outage are possible. **medium**
 means a real operational gap. **low** means a rough edge.
- 
+
 Within each table the entries are in order of id, and an id is never used
 twice. An id that appears in neither this file nor `decisions.md` was closed
 long ago: the "Fixed" table says "(Was W-nn.)" for each.
- 
+
 ## Start here
- 
+
 78 entries are open: 5 high, 18 medium and 31 low, and 24 things that have
 never been tried. These ten matter most. Read them before the rest.
- 
+
 | Id | Severity | In one line | When |
 |----|----------|-------------|------|
 | W-70 | high | A command is answered before it is on disk. A power cut can lose 10 ms of what clients were told happened. | Step 4 of the plan |
@@ -31,9 +31,9 @@ never been tried. These ten matter most. Read them before the rest.
 | W-25 | medium | One session can fill a shard with orders, and closing it then stalls everyone else there. | Needs D-19 |
 | W-08 | medium | The login token is sent in the clear. | Run order entry over a private link (S-23) |
 | W-72 | medium | The journal grows for ever and a restart replays all of it. | With snapshots, after step 5 |
- 
+
 ## Gateway
- 
+
 | Id | Severity | Weakness | Why it matters | Fix |
 |----|----------|----------|----------------|-----|
 | W-03 | low | The idle timeout is one number for every client, set when the venue starts. Until it runs out, a dead client's orders go on trading: five seconds by default. | A market maker on a private line wants a second or less. A client on home internet needs several. | A timeout per client, in the clients file or asked for at login, within limits the venue sets. |
@@ -48,7 +48,7 @@ never been tried. These ten matter most. Read them before the rest.
 | W-101 | low | `planck-client` does not reconnect by itself. Recovery is by starting it again with `--epoch` and `--next-report`. `planck-loadgen` asks for no recovery and does not notice a missing report. | The recovery path is exercised by the tests and by hand, not by a client that lives through a bad line. | Give `planck-client` a reconnect loop that keeps its own count. |
 
 ## Feed
- 
+
 | Id | Severity | Weakness | Why it matters | Fix |
 |----|----------|----------|----------------|-----|
 | W-10 | high | No snapshots. A subscriber that joins late, or loses more than the history holds (65,536 messages per stream by default), cannot rebuild its books. | The only signal is `ReceiverStats::lost` going up. After that the subscriber's books are wrong for the rest of the run. | A snapshot channel: book state as of a sequence number, then the live stream from there. |
@@ -57,9 +57,9 @@ never been tried. These ten matter most. Read them before the rest.
 | W-13 | medium | Retransmits are served by the same thread that publishes the live stream. | A burst of requests delays live market data. | Same fix as W-11: a separate thread reading the history. |
 | W-14 | low | A datagram the kernel refuses to send is tried once more, then counted and dropped. | Subscribers recover through a gap request, which costs them time. | Acceptable for UDP. Watch `PublisherStats::send_failures`. |
 | W-15 | low | The receiver gives up after 100 unanswered requests, 2 ms apart, with no backoff. | 200 ms may be too short for a publisher that is restarting. | Make both configurable and back off. |
- 
+
 ## Engine and book
- 
+
 | Id | Severity | Weakness | Why it matters | Fix |
 |----|----------|----------|----------------|-----|
 | W-21 | medium | A shard that cannot hand off its output stalls, and aborts the process after 2^34 spins. | One dead consumer takes the shard down with it. That is deliberate (it never drops a message), but there is no softer path. | Detect a dead consumer sooner and fail over, or shut down cleanly with a clear message. |
@@ -67,9 +67,9 @@ never been tried. These ten matter most. Read them before the rest.
 | W-23 | low | An order that may rest is given its slot before it is matched. When every slot is taken it is rejected as BookFull, even if it would have traded at once and freed more room than it needed. Orders that never rest (IOC, FOK, market) are not affected. | At the very limit of capacity the book turns away liquidity it could have matched. | Match first when the order crosses, and take a slot only for what is left. That needs care: fills cannot be taken back if no slot turns up afterwards. Or keep a few slots in reserve for this case. |
 | W-24 | medium | A whole command through a shard takes about 85 ns at the median in the sandbox. The book's own part of that is about 16 ns. The other 70 ns is the ring hop, the clock read, encoding the replies, staging them and pushing them out, and none of it has been profiled. | Most of the time on the matching path is spent around the matching, where there may be easy gains. | Profile `planck-bench --filter shard.inline` with `perf`. First suspects: two wire messages built and copied per order, and stage-then-copy for output that could go straight to the ring. |
 | W-25 | medium | Closing a session cancels everything it has resting in one command, and nothing limits how much that is. One session can fill the store, a million orders by default, and the shard then takes no other command until all of them are cancelled and two messages for each have gone to the rings. It does not wait inside the command, but it serves nobody else either. Every venue start does the same for the whole book. | Everyone else on that shard waits. A client could do it on purpose. | Depends on D-19: a limit on resting orders per session, or a close spread over several passes. |
- 
+
 ## Journal
- 
+
 | Id | Severity | Weakness | Why it matters | Fix |
 |----|----------|----------|----------------|-----|
 | W-70 | high | A command is answered before it is on disk. If the machine loses power, up to `--journal-sync` milliseconds of commands (10 by default) are gone, although clients were told they happened and the feed published them. | After such a restart the venue's books disagree with what clients and subscribers believe. A plain process crash loses nothing. | Depends on D-12. Hold reports until the sync that covers them, or replicate to a second machine. |
@@ -78,16 +78,16 @@ never been tried. These ten matter most. Read them before the rest.
 | W-73 | medium | Restart republishes the whole market data stream from sequence 1. Subscribers that kept running ignore what they have already seen, which works, but only because replay is exact. | A burst of old data at every restart, growing with the journal. | Goes away with snapshots (W-72). |
 | W-74 | medium | A journal can only be replayed into the same configuration: shard count, symbols, bands and order capacity. Anything else is refused. | Adding a symbol or raising a limit means throwing the journal away. | A migration tool, or a configuration record inside the journal so the venue can rebuild with the old settings and then change. |
 | W-75 | low | One recorder thread writes every shard's file, to one directory, with ordinary buffered writes. | With many busy shards the recorder, not the disk, becomes the limit, and a shard that outruns it stalls. | One recorder per disk, and preallocated files. Measure first. |
- 
+
 ## Clock
- 
+
 | Id | Severity | Weakness | Why it matters | Fix |
 |----|----------|----------|----------------|-----|
 | W-30 | medium | On the WSL2 development machine the kernel was slewing `CLOCK_REALTIME` and `CLOCK_MONOTONIC` at +100,000 ppm against `CLOCK_MONOTONIC_RAW`. Which of them is right is not established. | Timestamps and any latency measured on that machine may be off by 10 percent. | Recheck after `wsl --shutdown`. Do not trust latency numbers taken under WSL2 until this is understood. |
 | W-31 | low | Between re-anchors (at most once a second, and only when idle) the shard's clock drifts from the wall clock. A shard that is never idle never re-anchors. | Timestamps wander from real time under sustained load. | Re-anchor on a timer as well, from the idle path of a neighbouring thread, or accept and document the bound. |
- 
+
 ## Programs
- 
+
 | Id | Severity | Weakness | Why it matters | Fix |
 |----|----------|----------|----------------|-----|
 | W-60 | medium | `planckd` is configured only by flags. Symbols are numbered 1 to N with no names, and every symbol shares one price band. | A real symbol list needs a band per symbol and a stable mapping from name to id. | A small config file: id, name, band and shard per symbol. See D-10. |
@@ -100,7 +100,7 @@ never been tried. These ten matter most. Read them before the rest.
 | W-85 | low | `planck-loadgen` sends no token, so it cannot log in to a venue started with `--clients`. Its client ids must also stay at or below 65,535, which it does not check. `planck-client` takes its token on the command line, where other users of the machine can see it. The generator sends no heartbeats either: it is never quiet while it runs, but at a very low `--rate` with many sessions one of them could stay silent past the venue's timeout and be dropped. | A venue under load test has to be an open one, and for slow tests one started with `--idle-timeout 0 --heartbeat 0`. | Give the generator a clients file of its own. Let the client read its token from a file or the environment. |
 
 ## Not tested
- 
+
 | Id | What has never been exercised |
 |----|-------------------------------|
 | W-40 | The gateway disconnecting a client whose transmit buffer is full (`GatewayStats::slow_consumers`). The other way to be too slow, falling further behind than the held reports reach, has a test. |
@@ -127,9 +127,9 @@ never been tried. These ten matter most. Read them before the rest.
 | W-96 | A line that really dies: a cable pulled, a laptop closed, a tunnel dropped. The tests make a connection go silent on loopback, which is the same thing to the gateway but not to the kernel. Nor has the timeout been tried against a real slow link to see how often it drops a client that was only delayed. |
 | W-97 | The gateway's own clock going wrong. It reads the system's monotonic clock, which under WSL2 runs at an odd rate (W-30): a timeout of five seconds may be nearer four and a half of anyone else's. |
 | W-102 | Recovery over a line that really fails. The tests close a connection on loopback and connect again. Nobody has yet pulled a cable in the middle of a burst of fills and compared what the client recovered with the journal. Nor has recovery been run with the 256 blocks all taken, beyond a test with one. |
- 
+
 ## Measurement
- 
+
 | Id | Severity | Weakness | Fix |
 |----|----------|----------|-----|
 | W-50 | high | There are no trustworthy latency numbers. The tools now exist (`planck-bench`, `planck-loadgen`, see `benchmarks.md`), but every figure so far comes from a shared virtual machine with two CPUs. Nothing has been measured on pinned, isolated cores. The project's one-line claim is nanosecond tail latency. | Run both on real hardware with `--cpu`, isolated cores and a Release build, and write the results into `benchmarks.md`. Not under WSL2 until W-30 is understood. |
@@ -145,7 +145,7 @@ never been tried. These ten matter most. Read them before the rest.
 | W-103 | low | A record's wait to be durable is measured from the pass in which the recorder took it, not from when its command arrived or was matched. The hop from the shard to the recorder is left out, so the figure is a little low: microseconds against a wait of hundreds, but nobody has measured it. Nor can a test tell whether the time is read before the records are taken or just after. A seeded bug that moved it survived and was dropped. | Stamp each journal entry on the shard's clock and compare on the recorder, once the two clocks are known to agree (W-31). |
 
 ## C interface
- 
+
 | Id | Severity | Weakness | Why it matters | Fix |
 |----|----------|----------|----------------|-----|
 | W-90 | medium | `libplanck.so` is the matching engine and nothing else: one shard, driven on the caller's thread. No journal, no replay, no gateway, no feed, no second shard. | Enough to embed the books in a simulator or a backtest. Not enough to run or talk to a venue from another language. | Depends on D-15. |
@@ -154,9 +154,9 @@ never been tried. These ten matter most. Read them before the rest.
 | W-93 | low | `planck_engine_create` blocks for about 50 ms while the engine calibrates its clock, and every engine does so separately. | Creating many engines, as a parameter sweep would, is slow. | Calibrate once per process and share the result. |
 | W-94 | low | No install rules, no pkg-config file, no static variant of the library, and no language binding beyond the header. Linux only: the build relies on a linker version script. | Using the library outside this build tree means copying two files by hand. | Install rules and a `planck.pc`, when `scripts/` and packaging are done. |
 | W-95 | low | The promise that no call aborts on bad input rests on the checks in `capi/src/planck.cpp` being complete. Past them, a broken contract still aborts the host process in a checked build and is undefined behaviour in a release build. | A missed check at the boundary would take down the program that loaded the library. | Fuzz the C interface. Every struct is small and fixed, so this is cheap. |
- 
+
 ## Fixed
- 
+
 | Id | Date | What was wrong | What changed |
 |----|------|----------------|--------------|
 | F-01 | 2026-11 | `SpscRing::drain` returned fewer elements than were queued when its cached view was stale but not empty. | It now refreshes whenever the cached count is below the requested maximum. |
@@ -193,4 +193,4 @@ never been tried. These ten matter most. Read them before the rest.
 | F-32 | 2026-11 | `build.sh --cxx`, given to a build directory made with another compiler, turned that directory into a plain optimised build whatever its name. CMake discards its cache when the compiler changes, and the build type, contracts and sanitizers a preset chose went with it. `scripts/check_all.sh --cxx g++-16` then reported four configurations as passing that were one configuration four times, and the sanitizer directories stayed that way. Found on the first real use: the sanitizer builds ran 354 tests instead of 353, in the same time as the others. | `build.sh` compares the directory with what its name says and with the compiler asked for, and configures from scratch if they differ. That also repairs a directory already spoiled. `check_all.sh` prints the compiler each configuration used. A test with a stand-in `cmake` and three seeded bugs hold it. |
 | F-33 | 2026-11 | Step 3b had not been run under GCC 16. The earlier rows that say "passes on GCC 16" also rest on runs whose compiler nobody wrote down, on a machine where plain `g++` turned out to be 11.4. (Was W-48.) | `scripts/check_all.sh --gcc` reported all four GCC configurations passing with GCC 16.0.1 under WSL2, after F-32, with the compiler printed beside each result. That is the whole tree as it stands, so it covers the earlier rows too. |
 | F-34 | 2026-11 | Nothing measured how long a command takes to reach the disk, or what the disk costs on its own. (Was the first half of W-80.) | The recorder times every sync and every record's wait for the sync that covers it. `planckd --stats` prints them as `stats durable`. `planck-bench --filter journal.disk` times a commit of 1, 64 and 4096 records on a disk of your choosing. Step 4a of the plan. |
- 
+
