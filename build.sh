@@ -162,12 +162,57 @@ need() {
     command -v "$1" >/dev/null 2>&1 || die "$1 is not installed or not on PATH"
 }
 
+# What the build directory was last configured with, for one setting.
+cached() {
+    sed -n "s/^$1:[A-Z]*=//p" "${build_dir}/CMakeCache.txt" 2>/dev/null | head -n 1
+}
+
+# True if the compiler asked for is not the one the build directory has.
+other_compiler() {
+    local asked="$1" has="$2"
+    [ -n "$asked" ] || return 1
+    [ "$has" != "$asked" ] && [ "$has" != "$(command -v "$asked" 2>/dev/null)" ]
+}
+
+# True if the build directory exists and is not what its name says.
+#
+# CMake throws its whole cache away when the compiler changes, and what the
+# preset chose goes with it: the build type, the contracts, the sanitizers.
+# It then configures again with its own defaults. So build/gcc-asan, given
+# another compiler, would quietly become an optimised build with no
+# sanitizer, and report every test as passing under AddressSanitizer for
+# ever after. Such a directory has to be configured from scratch, which
+# applies the preset again. A directory left that way by an older build.sh
+# is caught too, by what it holds.
+misconfigured() {
+    [ -f "${build_dir}/CMakeCache.txt" ] || return 1
+    if other_compiler "$cxx" "$(cached CMAKE_CXX_COMPILER)" ||
+       other_compiler "$cc" "$(cached CMAKE_C_COMPILER)"; then
+        return 0
+    fi
+    local sanitize="" contracts="auto" build_type="RelWithDebInfo"
+    case "$kind" in
+        release) build_type="Release" ;;
+        debug)   build_type="Debug" ;;
+        checked) contracts="checked" ;;
+        asan)    contracts="checked"; sanitize="address,undefined" ;;
+        tsan)    contracts="checked"; sanitize="thread" ;;
+    esac
+    [ "$(cached PLANCK_SANITIZE)" != "$sanitize" ] ||
+        [ "$(cached PLANCK_CONTRACTS)" != "$contracts" ] ||
+        [ "$(cached CMAKE_BUILD_TYPE)" != "$build_type" ]
+}
+
 configure() {
     need cmake
     need ninja
     local arguments=(--preset "$preset" "-DPLANCK_NATIVE=${native}")
     [ -n "$cxx" ] && arguments+=("-DCMAKE_CXX_COMPILER=${cxx}")
     [ -n "$cc" ] && arguments+=("-DCMAKE_C_COMPILER=${cc}")
+    if [ "$fresh" -eq 0 ] && misconfigured; then
+        say "build/${preset} was configured for another compiler or another kind of build: starting it afresh"
+        fresh=1
+    fi
     [ "$fresh" -eq 1 ] && arguments+=(--fresh)
     # A build directory made by hand, straight in build/, would shadow the
     # ones made here.

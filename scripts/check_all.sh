@@ -12,7 +12,9 @@
 set -u
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# Both compilers optimised and checked, and each sanitizer once.
+# Both compilers optimised and checked, and each sanitizer once, with GCC.
+# The Clang sanitizer builds need Clang's runtime library installed
+# (libclang-rt-dev on Debian and Ubuntu) and are part of --full only.
 configurations=(gcc-release gcc-checked gcc-asan gcc-tsan clang-release clang-checked)
 only=""
 passthrough=()
@@ -47,7 +49,10 @@ for configuration in "${configurations[@]}"; do
     printf '%-16s ' "$configuration"
     if "$root/build.sh" test "--${compiler}" "--${kind}" ${passthrough[@]+"${passthrough[@]}"} > "$log" 2>&1; then
         summary="$(grep -E 'tests passed' "$log" | tail -n 1)"
-        echo "ok      $((SECONDS - started))s   ${summary}"
+        # Say which compiler it really was: the build directory knows.
+        used="$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' \
+            "$root/build/$configuration/CMakeCache.txt" 2>/dev/null | head -n 1)"
+        echo "ok      $((SECONDS - started))s   ${summary}   ${used}"
     else
         echo "FAILED  $((SECONDS - started))s"
         grep -E 'error:|\*\*\*Failed|\*\*\*Timeout|tests failed|build.sh:' "$log" | head -n 20 | sed 's/^/    /'

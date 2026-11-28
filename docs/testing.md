@@ -11,6 +11,7 @@ is expected of new code.
 ./build.sh test --checked -R OrderBook    # tests whose name matches
 ./build.sh test --tsan -L integration     # the threaded tests under ThreadSanitizer
 scripts/check_all.sh                      # six configurations, one after another
+scripts/check_all.sh --gcc --cxx g++-16 --cc gcc-16   # the GCC ones, with a compiler by name
 ```
 
 Straight ctest works too:
@@ -126,7 +127,7 @@ at a time in a private copy of the repository, rebuilds, and confirms that
 a test fails.
 
 ```bash
-tools/seeded_bugs.py                # all 132, about 55 minutes on two CPUs
+tools/seeded_bugs.py                # all 135, about 55 minutes on two CPUs
 tools/seeded_bugs.py --only capi    # the ones whose label matches
 tools/seeded_bugs.py --list
 ```
@@ -148,7 +149,7 @@ the bug back. `tools_selftest` checks on every test run that each entry's
 pattern still occurs exactly once in the source, so the catalogue cannot
 silently rot.
 
-The catalogue is lopsided: 39 of its 132 entries are in `capi/` and `bench/`,
+The catalogue is lopsided: 39 of its 135 entries are in `capi/` and `bench/`,
 12 are from the session work in `gateway/`, 24 are for cancel on disconnect
 15 for heartbeats and silence and 37 for report recovery and repeated
 orders (W-51). Backfilling the older modules is open work.

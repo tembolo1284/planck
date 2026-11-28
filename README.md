@@ -109,22 +109,36 @@ section of [contributing.md](docs/contributing.md). What is being built
 next, and in what order, is the "Agreed plan" at the top of
 [decisions.md](docs/decisions.md).
 
-## The short list of things to know
+## Where it stands
 
-- **No trustworthy latency numbers exist yet.** The benchmarks work. Every
-  figure so far is from a shared two-CPU virtual machine (W-50).
-- **Durability is asynchronous.** A command is answered before it is on disk.
-  A process crash loses nothing. A power cut can lose up to 10 ms (W-70,
-  D-12).
-- **Resting orders do not outlive a connection or a restart.** A client's
-  orders are cancelled when its connection ends, and every order is
-  cancelled when the venue starts (S-27, S-28). A line that dies without
-  closing is noticed by its silence, after five seconds by default (S-31).
-- **A client that reconnects can ask for the reports it missed,** and an
-  order sent twice is carried out once (S-33, S-34). The reports are held
-  in memory: the last 1024 for each client, and none across a restart of
-  the venue (W-98, W-99).
-- **The login token is sent in the clear.** `planckd --clients` says who may
-  log in, and order entry must run over a private link (S-23, W-08).
+What the venue does today:
+
+- **Matches** limit, market, IOC and FOK orders in price and time priority,
+  on one thread per shard, with nothing allocated after startup.
+- **Knows its clients.** `planckd --clients` says who may log in. A client
+  is the same session on every connection (S-23, S-24).
+- **Cancels what a client leaves behind.** A client's orders are cancelled
+  when its connection ends, and every order when the venue starts (S-27,
+  S-28). A line that dies without closing is noticed by its silence, after
+  five seconds by default (S-31).
+- **Lets a client catch up.** Reports are numbered, and a client that
+  reconnects is sent the ones it missed. An order sent twice is carried out
+  once (S-33, S-34).
+- **Rebuilds itself.** With `--journal`, a restart replays every command
+  and arrives at the same books and the same market data stream.
+- **Publishes market data** over UDP with gap recovery by retransmission.
+
+What it does not do yet, most serious first. The full list, with ten to
+read first, is [weaknesses.md](docs/weaknesses.md):
+
+- **No trustworthy latency numbers exist.** The benchmarks work. Every
+  figure so far is from a shared virtual machine or WSL2 (W-50).
+- **Durability is asynchronous.** A command is answered before it is on
+  disk. A process crash loses nothing. A power cut can lose up to 10 ms
+  (W-70, D-12). Step 4 of the plan.
 - **The feed has no snapshots.** A subscriber that falls too far behind
-  cannot recover (W-10, D-05).
+  cannot recover (W-10, D-05). Step 5.
+- **Reports held for a client do not survive a restart,** and only the
+  last 1024 for each client are held at all (W-98, W-99).
+- **The login token is sent in the clear.** Order entry must run over a
+  private link (S-23, W-08).

@@ -65,7 +65,7 @@ Scripts should wait for `ready` before connecting. On the way down it prints
 # desk A
 1 1001
 2 0x7d2          # tokens may be hexadecimal
-17 18364758544493064720
+17 123456789
 ```
 
 The first number is the client id, from 1 to 65,535, listed once. The
@@ -74,7 +74,8 @@ comment. A file with a mistake in it stops the venue from starting, and the
 message names the line. At most 4,096 clients.
 
 - A client logs in with its id and token: `planck-client --client-id 17
-  --token 18364758544493064720`. The token is decimal on the command line.
+  --token N`, with N the number from the file. The token is decimal on the
+  command line.
 - The client id is the session id. It owns the client's orders, and it is
   how the journal names the client, so do not hand a retired client's id to
   someone new if the journal should stay readable as a record.

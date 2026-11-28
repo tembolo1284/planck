@@ -23,7 +23,7 @@ All three end up in the same place.
 | Option | Meaning |
 |--------|---------|
 | `--gcc`, `--clang` | Which compiler. GCC is the default. |
-| `--cxx PATH`, `--cc PATH` | An exact compiler executable, for example `g++-16`. |
+| `--cxx PATH`, `--cc PATH` | An exact compiler executable, for example `g++-16`. A build directory that was made with another compiler is started afresh, and stays on the new one afterwards. |
 | `--release`, `--debug`, `--checked`, `--asan`, `--tsan` | The build kind. See below. |
 | `-j N` | Parallel jobs. Default is every CPU. |
 | `--target NAME` | Build one target, for example `planckd`. |
@@ -139,6 +139,7 @@ library should include it, add it to the `foreach` in `capi/CMakeLists.txt`.
 |---------|------------|
 | `build/ holds an old build made without presets` | `rm -rf build`, once. |
 | A warning breaks the build on a new compiler | That is `-Werror` doing its job. Fix the code. If the warning is wrong, suppress it at the one site with a comment saying why. |
-| `contract mode 'assume' needs [[assume]]` | A compiler that is neither GCC 13+ nor Clang. Use `--checked`, or teach `contract.hpp` about it. |
+| `contract mode 'assume' needs [[assume]]` | The compiler is neither GCC 13+ nor Clang. The usual cause is that plain `g++` is an old one and the new one has another name: `g++ --version` tells. Name the new one with `--cxx g++-16 --cc gcc-16`. GCC 11 does build the checked and sanitizer kinds, but it is not a compiler this is developed with. |
+| A sanitizer build runs as many tests as an ordinary one, or as fast | It is not a sanitizer build. `scripts/check_all.sh` prints the compiler of each configuration, and a sanitizer configuration runs one test fewer than the others. An old `build.sh` could leave a directory this way (F-32). The present one notices and starts the directory afresh. |
 | Clang sanitizer builds fail to link | Install Clang's runtime (`libclang-rt-dev`). Not tested in development (W-77). |
 | Link errors about `-fPIC` in `capi/` | Something was added to the venue's libraries that the C library also needs. See "Adding a source file". |

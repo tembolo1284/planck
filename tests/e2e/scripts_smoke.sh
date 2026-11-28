@@ -51,6 +51,47 @@ refused --jobs many
 refused --jobs
 refused test --nonsense
 
+# A build directory must be what its name says. CMake forgets everything a
+# preset chose when the compiler changes, so build.sh has to notice and
+# configure from scratch. This runs a copy of build.sh against a stand-in
+# for cmake that only records what it was asked, in a directory whose
+# "build" holds nothing but the settings.
+mkdir -p "$work/copy/build/gcc-asan" "$work/bin"
+cp "$root/build.sh" "$work/copy/build.sh"
+for tool in cmake ninja ctest; do
+    printf '#!/bin/sh\necho "$@" >> "%s/asked"\n' "$work" > "$work/bin/$tool"
+    chmod +x "$work/bin/$tool"
+done
+settings() {  # compiler, sanitizers, contracts, build type
+    printf 'CMAKE_CXX_COMPILER:STRING=%s\nCMAKE_C_COMPILER:STRING=/usr/bin/gcc\n' "$1"
+    printf 'PLANCK_SANITIZE:STRING=%s\nPLANCK_CONTRACTS:STRING=%s\n' "$2" "$3"
+    printf 'CMAKE_BUILD_TYPE:STRING=%s\nPLANCK_NATIVE:BOOL=OFF\n' "$4"
+}
+configured() {  # the options to build.sh, after the settings on stdin
+    cat > "$work/copy/build/gcc-asan/CMakeCache.txt"
+    rm -f "$work/asked"
+    PATH="$work/bin:$PATH" "$work/copy/build.sh" build --asan "$@" > "$work/copy.log" 2>&1 ||
+        fail "build.sh failed against a stand-in cmake: $(cat "$work/copy.log")"
+    grep -- "--preset gcc-asan" "$work/asked" || true
+}
+afresh() { configured "$@" | grep -q -- "--fresh"; }
+here="$(command -v sh)"
+
+settings /usr/bin/g++ "address,undefined" checked RelWithDebInfo | afresh &&
+    fail "a build directory that is as it should be was thrown away"
+settings /usr/bin/g++ "" auto Release | afresh ||
+    fail "a directory named for a sanitizer and built without one was accepted"
+settings /usr/bin/g++ "thread" checked RelWithDebInfo | afresh ||
+    fail "a directory named for one sanitizer and built with another was accepted"
+settings /usr/bin/g++ "address,undefined" auto RelWithDebInfo | afresh ||
+    fail "a sanitizer build without its contracts was accepted"
+settings /usr/bin/g++ "address,undefined" checked RelWithDebInfo | afresh --cxx "$here" ||
+    fail "a new compiler was given to an old build directory without starting it afresh"
+settings "$here" "address,undefined" checked RelWithDebInfo | afresh --cxx "$(basename "$here")" &&
+    fail "the same compiler by its short name was taken for another"
+settings "$here" "address,undefined" checked RelWithDebInfo | afresh --cxx "$here" &&
+    fail "the same compiler was taken for another"
+
 # ---- the others ----
 
 "$root/scripts/check_all.sh" --help | grep -q -- "--quick" || fail "check_all.sh --help is missing"

@@ -13,10 +13,10 @@ these documents brought up to date.
 
 | Step | What | Covers | State |
 |-----:|------|--------|-------|
-| 1 | Sessions that outlive connections, and a list of who may log in | D-02, W-02, W-05 | done: S-23, S-24 |
-| 2 | Cancel on disconnect, and at restart | D-01, D-14, W-01 | done: S-27, S-28 |
-| 3a | Heartbeats, and dropping a connection that has gone silent | W-03 | done: S-31, S-32 |
-| 3b | Report sequence numbers, report recovery, idempotent orders | W-04 | done: S-33, S-34, S-35 |
+| 1 | Sessions that outlive connections, and a list of who may log in | D-02, W-02, W-05 | done: S-23 to S-26, F-19, F-20, F-21 |
+| 2 | Cancel on disconnect, and at restart | D-01, D-14, W-01 | done: S-27 to S-30, F-23 |
+| 3a | Heartbeats, and dropping a connection that has gone silent | W-03 | done: S-31, S-32, F-25, F-26 |
+| 3b | Report sequence numbers, report recovery, idempotent orders | W-04 | done: S-33, S-34, S-35, F-27, F-28 |
 | 4 | A commit boundary: nothing is told to anyone before it is durable. Measure the cost first. Held reports that survive a restart. | D-12, D-13, W-70, W-71, W-80, W-98 | next |
 | 5 | Feed snapshots and a separate, rate-limited recovery service | D-05, W-10, W-11, W-13 | |
 | 6 | A failed market data consumer must not stop matching | W-21 | |
@@ -24,6 +24,12 @@ these documents brought up to date.
 
 Replicating commands to a standby engine comes after step 4, as a project
 of its own.
+
+"Covers" names each item as it was called when the plan was made. The ones
+that are done no longer appear under "Open" here or in `weaknesses.md`: the
+S and F entries under "State" say what was decided and what changed. Where
+a step left part of an item open, that part has an entry of its own: W-05
+and W-03 still exist in a narrower form.
 
 ## Open
 
