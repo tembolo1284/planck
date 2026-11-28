@@ -1,0 +1,18 @@
+[package]
+name = "planck-wire"
+# The minor version is the wire protocol version: wire::kProtocolVersion.
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.85"
+description = "The planck wire protocol in Rust: order entry and market data, byte for byte"
+repository = "https://github.com/tembolo1284/planck"
+publish = false
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

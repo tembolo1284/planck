@@ -36,12 +36,18 @@ planck_add_test(planck_unit_tests LABEL unit SOURCES
     unit/ladder_bitmap_test.cpp
     unit/order_book_test.cpp
     unit/wire_test.cpp
+    unit/wire_fixture_test.cpp
     unit/shard_test.cpp
     unit/net_test.cpp
     unit/perf_test.cpp
     unit/credentials_test.cpp
     unit/journal_test.cpp
 )
+
+# The wire format as files, shared with rust/planck-wire. See
+# unit/wire_fixture_test.cpp.
+target_compile_definitions(planck_unit_tests PRIVATE
+    PLANCK_WIRE_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/wire/v3")
 
 # Randomized checks against an independent model. Scale with PLANCK_TEST_SCALE.
 planck_add_test(planck_property_tests LABEL property SOURCES
@@ -108,4 +114,15 @@ if(Python3_FOUND)
     add_test(NAME tools_selftest
              COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/tests/test_tools.py)
     set_tests_properties(style tools_selftest PROPERTIES LABELS tools TIMEOUT 60)
+endif()
+
+# The Rust codec for the wire protocol, checked against the same fixture
+# files as unit/wire_fixture_test.cpp. Skipped where there is no cargo.
+find_program(CARGO_EXECUTABLE cargo)
+if(CARGO_EXECUTABLE)
+    add_test(NAME rust_wire
+             COMMAND ${CARGO_EXECUTABLE} test --quiet
+                     --manifest-path ${PROJECT_SOURCE_DIR}/rust/planck-wire/Cargo.toml
+                     --target-dir ${PROJECT_BINARY_DIR}/rust-target)
+    set_tests_properties(rust_wire PROPERTIES LABELS rust TIMEOUT 600)
 endif()
