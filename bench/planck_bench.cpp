@@ -5,10 +5,14 @@
 // slow case, not the average. See docs/benchmarks.md for how to read the
 // output and how to get numbers worth trusting.
 
+#include <unistd.h>
+
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <span>
@@ -22,6 +26,7 @@
 #include "planck/book/order_book.hpp"
 #include "planck/core/hint.hpp"
 #include "planck/engine/shard.hpp"
+#include "planck/journal/writer.hpp"
 #include "planck/mem/arena.hpp"
 #include "planck/perf/histogram.hpp"
 #include "planck/ring/spsc.hpp"
@@ -57,6 +62,9 @@ constexpr char kUsage[] =
     "  --cpu N           pin the measuring thread to this CPU\n"
     "  --cpu2 N          pin the second thread of the two-thread benchmarks,\n"
     "                    and let it spin instead of yielding\n"
+    "  --journal-dir DIR where journal.disk writes its file. What it measures is\n"
+    "                    the disk under DIR, so name the one the journal will\n"
+    "                    live on                   ($TMPDIR, or /tmp)\n"
     "  --csv             comma separated output\n"
     "  --quick           a few thousand samples: checks that everything runs\n";
 
@@ -66,6 +74,7 @@ struct Context {
     std::uint64_t samples = 0;
     bool second_cpu_given = false;
     std::size_t second_cpu = 0;
+    std::string_view journal_dir{};
 };
 
 // False means the benchmark could not be set up or saw a wrong answer.
@@ -646,6 +655,58 @@ bool bench_shard_thread(const Context& context) {
     return true;
 }
 
+// ---- the journal's disk ----
+
+// What it costs to make records safe: append them, hand them to the kernel
+// and wait for the disk to say it has them. One sample is one such commit,
+// of 1, 64 or 4096 records. Nearly all of it is the wait for the disk, so
+// this is a measurement of the disk and its filesystem and of nothing in
+// planck. It is the number D-12 turns on: a venue that tells nobody
+// anything before it is durable adds one of these to an answer, shared
+// among however many commands it commits together.
+//
+// A sync is slow, milliseconds on some disks, so this takes a thousandth of
+// the samples the other rows take, and at least 50.
+bool bench_journal_disk(const Context& context) {
+    char path[512];
+    const int length = std::snprintf(path, sizeof(path), "%.*s/planck-bench-%ld.journal",
+                                     static_cast<int>(context.journal_dir.size()),
+                                     context.journal_dir.data(), static_cast<long>(::getpid()));
+    if (length < 0 || static_cast<std::size_t>(length) >= sizeof(path)) {
+        return complain("journal: --journal-dir is too long");
+    }
+    static_cast<void>(::unlink(path));
+    const auto writer = std::make_unique<planck::journal::Writer>();
+    if (!ok(writer->open(path, core::ShardId{0}, 1))) {
+        std::fprintf(stderr, "planck-bench: cannot create %s\n", path);
+        return false;
+    }
+    std::uint64_t commits = context.samples / 1000;
+    commits = (commits < 50) ? 50 : commits;
+
+    bool good = true;
+    engine::JournalEntry entry{};
+    entry.command = engine::make_session_closed(core::SessionId{1});
+    constexpr std::array<std::uint32_t, 3> kBatches{1, 64, 4096};
+    constexpr std::array<std::string_view, 3> kNames{"journal.commit_1", "journal.commit_64",
+                                                     "journal.commit_4096"};
+    for (std::size_t row = 0; row < kBatches.size() && good; ++row) {
+        Histogram commit;
+        for (std::uint64_t i = 0; i < commits && good; ++i) {
+            const std::uint64_t started = Stopwatch::start();
+            for (std::uint32_t k = 0; k < kBatches[row] && good; ++k) {
+                entry.sequence = writer->next_sequence();
+                good = ok(writer->append(entry));
+            }
+            good = good && ok(writer->flush()) && ok(writer->sync());
+            commit.record(context.watch.stop(started));
+        }
+        context.table.row(kNames[row], commit);
+    }
+    static_cast<void>(::unlink(path));
+    return good || complain("journal: could not write or sync the file");
+}
+
 struct Bench {
     std::string_view name;
     std::string_view what;
@@ -664,6 +725,8 @@ constexpr Bench kBenches[] = {
     {"shard.journal", "the same with journaling on", bench_shard_journal},
     {"shard.disconnect", "the same with cancel on disconnect on", bench_shard_disconnect},
     {"shard.thread", "command in to report out across two threads", bench_shard_thread},
+    {"journal.disk", "append, write and sync 1, 64 and 4096 records: the disk's cost",
+     bench_journal_disk},
 };
 
 int run(int argc, const char* const* argv) {
@@ -679,7 +742,9 @@ int run(int argc, const char* const* argv) {
     std::uint64_t samples = quick ? 3'000 : 1'000'000;
     std::size_t cpu = sys::kMaxCpus;
     std::size_t cpu2 = sys::kMaxCpus;
-    if (!args.text("--filter", filter) ||
+    const char* const tmpdir = std::getenv("TMPDIR");
+    std::string_view journal_dir = (tmpdir != nullptr && tmpdir[0] != '\0') ? tmpdir : "/tmp";
+    if (!args.text("--filter", filter) || !args.text("--journal-dir", journal_dir) ||
         !args.number<std::uint64_t>("--samples", samples, 100, 1'000'000'000) ||
         !args.number<std::size_t>("--cpu", cpu, 0, sys::kMaxCpus - 1) ||
         !args.number<std::size_t>("--cpu2", cpu2, 0, sys::kMaxCpus - 1) || !args.finish()) {
@@ -715,7 +780,8 @@ int run(int argc, const char* const* argv) {
                           .table = table,
                           .samples = samples,
                           .second_cpu_given = (cpu2 != sys::kMaxCpus),
-                          .second_cpu = (cpu2 != sys::kMaxCpus) ? cpu2 : 0};
+                          .second_cpu = (cpu2 != sys::kMaxCpus) ? cpu2 : 0,
+                          .journal_dir = journal_dir};
     table.header();
     std::size_t ran = 0;
     bool all_good = true;

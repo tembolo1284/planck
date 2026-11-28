@@ -41,7 +41,10 @@ wait_for() {
 
 # ---- in process ----
 
-"$bench/planck-bench" --quick --csv > "$work/bench.log" 2> "$work/bench-err.log" \
+# With a temporary directory of its own, so that what the journal rows leave
+# behind can be told from anybody else's files.
+mkdir "$work/tmp"
+TMPDIR="$work/tmp" "$bench/planck-bench" --quick --csv > "$work/bench.log" 2> "$work/bench-err.log" \
     || fail "planck-bench did not finish cleanly"
 expect bench.log "^timer.empty_interval,200000," "the timer's own cost must be reported"
 for row in book.add book.cancel book.match_1_fill book.match_10_fills \
@@ -52,7 +55,23 @@ for row in book.add book.cancel book.match_1_fill book.match_10_fills \
            shard_thread.rest shard_thread.cancel shard_thread.trade; do
     expect bench.log "^$row,3000," "benchmark $row is missing or short of samples"
 done
-[ "$(wc -l < "$work/bench.log")" -eq 21 ] || fail "expected a header and 20 rows"
+# What a commit costs on this disk. A sync is slow, so these take few samples.
+for row in journal.commit_1 journal.commit_64 journal.commit_4096; do
+    expect bench.log "^$row,50," "benchmark $row is missing or has the wrong number of samples"
+done
+[ "$(wc -l < "$work/bench.log")" -eq 24 ] || fail "expected a header and 23 rows"
+[ -z "$(ls "$work/tmp")" ] || fail "planck-bench left its journal file behind"
+
+# The journal benchmark writes where it is told, and says so if it cannot.
+mkdir "$work/disk"
+"$bench/planck-bench" --quick --csv --filter journal.disk --journal-dir "$work/disk" \
+    > "$work/disk.log" 2>> "$work/bench-err.log" || fail "planck-bench --journal-dir failed"
+expect disk.log "^journal.commit_64,50," "--journal-dir did not run the journal benchmark"
+[ -z "$(ls "$work/disk")" ] || fail "planck-bench left a file in --journal-dir"
+"$bench/planck-bench" --quick --filter journal.disk --journal-dir "$work/no-such-place" \
+    > "$work/nodisk.log" 2>&1
+[ $? -eq 1 ] || fail "a journal directory that does not exist must be an error"
+expect nodisk.log "cannot create" "the failure must say what could not be written"
 
 "$bench/planck-bench" --quick --filter book.match > "$work/filter.log" 2>> "$work/bench-err.log" \
     || fail "planck-bench --filter failed"

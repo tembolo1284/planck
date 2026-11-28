@@ -310,6 +310,9 @@ expect venue2.log '^stats engine commands=24 accepted=7 rejected=2 trades=2 canc
 expect venue2.log '^stats feed messages=13 ' "the venue's feed counters are wrong"
 expect venue2.log '^stats journal records=14 .* discarded=0 failed=0$' \
     "the journal did not record the fourteen commands of the second life"
+# Every one of them was timed from the recorder taking it to its sync.
+expect venue2.log '^stats durable records=14 p50_ns=[0-9]+ .* sync_max_ns=[0-9]+$' \
+    "the venue did not report how long its records took to be safe"
 expect venue2.log '^stats gateway .* idle_timeouts=1 login_timeouts=0 ' \
     "the venue did not count the client it gave up on"
 expect venue2.log '^stats gateway .* recovered=2 recoveries=2 recovery_gaps=0 duplicate_orders=1$' \

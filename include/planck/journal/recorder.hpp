@@ -13,6 +13,7 @@
 #include "planck/core/types.hpp"
 #include "planck/engine/shard.hpp"
 #include "planck/journal/writer.hpp"
+#include "planck/perf/histogram.hpp"
 
 namespace planck::journal {
 
@@ -33,6 +34,9 @@ struct RecorderConfig {
     bool pin = false;
     std::size_t cpu = 0;
     engine::IdlePolicy idle = engine::IdlePolicy::Spin;
+    // Where the recorder reads the time, in nanoseconds that never go back.
+    // Null: the system's monotonic clock. Tests set it.
+    std::uint64_t (*clock)() noexcept = nullptr;
 };
 
 // Plain counters, written only by the recorder thread.
@@ -91,13 +95,44 @@ public:
     [[nodiscard]] core::Status error() const noexcept { return error_; }
     [[nodiscard]] const RecorderStats& stats() const noexcept { return stats_; }
 
+    // How long each sync took, in nanoseconds: one sample for every sync of
+    // every file.
+    [[nodiscard]] const perf::Histogram& sync_times() const noexcept { return sync_times_; }
+    // How long each record waited to be safe, in nanoseconds: from the pass
+    // in which the recorder took it off its shard's ring to the end of the
+    // sync that covered it. One sample for every record synced. This is the
+    // time a venue that told nobody anything before it was durable would
+    // add to every answer (D-12). It leaves out the hop from the shard to
+    // the recorder, which is short and is not the recorder's to measure.
+    //
+    // Records taken within kDurableResolutionNs of one another, or a
+    // 512th of the sync interval if that is longer, are timed together from
+    // the earliest of them, so a figure can be too high by that much and
+    // never too low.
+    [[nodiscard]] const perf::Histogram& durable_times() const noexcept { return durable_times_; }
+    static constexpr std::uint64_t kDurableResolutionNs = 1000;
+
 private:
+    // Records taken at about the same time and not yet synced.
+    struct Waiting {
+        std::uint64_t taken_ns = 0;
+        std::uint64_t records = 0;
+    };
+    // Enough for every group a sync interval can hold: see resolution_ns_.
+    static constexpr std::size_t kMaxWaiting = 1024;
+
     struct Stream {
         engine::Shard* shard = nullptr;
         Writer writer{};
         // Handed to the kernel but not yet known to be on the disk.
         bool unsynced = false;
+        std::size_t waiting_count = 0;
+        std::array<Waiting, kMaxWaiting> waiting{};
     };
+
+    [[nodiscard]] std::uint64_t now() const noexcept;
+    // Note that `records` were taken from a stream's shard at `taken_ns`.
+    void note_taken(Stream& stream, std::uint64_t taken_ns, std::uint64_t records) noexcept;
 
     void fail(core::Status status) noexcept;
     void sync_all() noexcept;
@@ -107,6 +142,10 @@ private:
     std::size_t stream_count_ = 0;
     std::uint64_t sync_interval_ns_ = 0;
     std::uint64_t last_sync_ns_ = 0;
+    std::uint64_t resolution_ns_ = kDurableResolutionNs;
+    std::uint64_t (*clock_)() noexcept = nullptr;
+    perf::Histogram sync_times_{};
+    perf::Histogram durable_times_{};
     bool failed_ = false;
     core::Status error_ = core::Status::Ok;
     engine::IdlePolicy idle_ = engine::IdlePolicy::Spin;

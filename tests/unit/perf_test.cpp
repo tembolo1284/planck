@@ -71,6 +71,31 @@ TEST(HistogramTest, TracksCountMinMaxAndMeanExactly) {
     EXPECT_EQ(histogram->percentile(1.0), 900U) << "the top percentile is the largest sample, exactly";
 }
 
+TEST(HistogramTest, AValueSeenManyTimesAtOnceCountsThatManyTimes) {
+    Histogram at_once;
+    Histogram one_by_one;
+    at_once.record(7, 3);
+    at_once.record(1'000'000, 2);
+    at_once.record(1, 0);  // seen no times: not seen, whatever the value
+    at_once.record(2'000'000, 0);
+    for (int i = 0; i < 3; ++i) {
+        one_by_one.record(7);
+    }
+    one_by_one.record(1'000'000);
+    one_by_one.record(1'000'000);
+    EXPECT_EQ(at_once.count(), 5U);
+    EXPECT_EQ(at_once.min(), 7U);
+    EXPECT_EQ(at_once.max(), 1'000'000U);
+    EXPECT_DOUBLE_EQ(at_once.mean(), one_by_one.mean());
+    for (const double fraction : {0.0, 0.5, 0.6, 0.61, 0.99, 1.0}) {
+        EXPECT_EQ(at_once.percentile(fraction), one_by_one.percentile(fraction)) << fraction;
+    }
+    Histogram nothing;
+    nothing.record(55, 0);
+    EXPECT_TRUE(nothing.empty());
+    EXPECT_EQ(nothing.min(), 0U);
+}
+
 TEST(HistogramTest, PercentilesOfSmallValuesAreExact) {
     const auto histogram = std::make_unique<Histogram>();
     for (std::uint64_t value = 1; value <= 50; ++value) {

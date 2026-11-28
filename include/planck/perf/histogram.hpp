@@ -52,6 +52,18 @@ public:
         max_ = (value > max_) ? value : max_;
     }
 
+    // The same value seen `times` times, at the cost of seeing it once.
+    void record(std::uint64_t value, std::uint64_t times) noexcept {
+        if (times == 0) {
+            return;
+        }
+        counts_[index_of(value)] += times;
+        count_ += times;
+        sum_ += value * times;
+        min_ = (value < min_) ? value : min_;
+        max_ = (value > max_) ? value : max_;
+    }
+
     [[nodiscard]] std::uint64_t count() const noexcept { return count_; }
     [[nodiscard]] bool empty() const noexcept { return count_ == 0; }
     // Zero when empty.

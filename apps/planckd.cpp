@@ -251,6 +251,10 @@ struct JournalRuntime {
     Lifecycle life;
     std::thread thread;
     Counter records, bytes, syncs, discarded, failed;
+    // How long records waited to be safe on disk, and how long a sync took.
+    Counter durable_count, durable_p50, durable_p99, durable_p999, durable_max;
+    Counter sync_p50, sync_p99, sync_max;
+    std::uint64_t last_summary_ns = 0;
 
     void publish_stats() noexcept {
         const journal::RecorderStats& s = recorder.stats();
@@ -259,6 +263,27 @@ struct JournalRuntime {
         syncs.set(s.syncs);
         discarded.set(s.discarded);
         failed.set(recorder.failed() ? 1 : 0);
+        publish_times(false);
+    }
+
+    // Working out percentiles walks two histograms, so a few times a second
+    // and no more, unless told that this is the last chance.
+    void publish_times(bool now) noexcept {
+        const std::uint64_t time = sys::monotonic_now().raw();
+        if (!now && (time - last_summary_ns) < 250'000'000) {
+            return;
+        }
+        last_summary_ns = time;
+        const planck::perf::Summary durable = recorder.durable_times().summary();
+        durable_count.set(durable.count);
+        durable_p50.set(durable.p50);
+        durable_p99.set(durable.p99);
+        durable_p999.set(durable.p999);
+        durable_max.set(durable.max);
+        const planck::perf::Summary sync = recorder.sync_times().summary();
+        sync_p50.set(sync.p50);
+        sync_p99.set(sync.p99);
+        sync_max.set(sync.max);
     }
 };
 
@@ -466,6 +491,7 @@ void journal_main(Venue& venue, const Options& options) noexcept {
           [&runtime]() noexcept { return runtime.recorder.poll(); });
     runtime.recorder.finish();
     runtime.publish_stats();
+    runtime.publish_times(true);
 }
 
 // Wait for a thread to finish starting. False if it failed.
@@ -561,6 +587,18 @@ void print_stats(const Venue& venue, std::uint32_t shards) noexcept {
                     static_cast<unsigned long long>(j.syncs.get()),
                     static_cast<unsigned long long>(j.discarded.get()),
                     static_cast<unsigned long long>(j.failed.get()));
+    }
+    if (j.durable_count.get() != 0) {
+        std::printf("stats durable records=%llu p50_ns=%llu p99_ns=%llu p999_ns=%llu max_ns=%llu "
+                    "sync_p50_ns=%llu sync_p99_ns=%llu sync_max_ns=%llu\n",
+                    static_cast<unsigned long long>(j.durable_count.get()),
+                    static_cast<unsigned long long>(j.durable_p50.get()),
+                    static_cast<unsigned long long>(j.durable_p99.get()),
+                    static_cast<unsigned long long>(j.durable_p999.get()),
+                    static_cast<unsigned long long>(j.durable_max.get()),
+                    static_cast<unsigned long long>(j.sync_p50.get()),
+                    static_cast<unsigned long long>(j.sync_p99.get()),
+                    static_cast<unsigned long long>(j.sync_max.get()));
     }
 }
 

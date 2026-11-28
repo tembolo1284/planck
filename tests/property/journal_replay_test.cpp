@@ -52,6 +52,8 @@ struct Session {
     // highest client order id among them.
     std::uint64_t commands_shown = 0;
     std::vector<std::uint64_t> order_ids = std::vector<std::uint64_t>(65'536);
+    // Where the recorder reads the time. Null: the real clock.
+    std::uint64_t (*clock)() noexcept = nullptr;
 
     // Start a shard and bring it up to date from whatever journal is there.
     Status start(const std::string& directory, const engine::ShardConfig& config,
@@ -81,6 +83,7 @@ struct Session {
         recorder_config.fingerprints = fingerprints;
         recorder_config.directory = directory;
         recorder_config.sync_interval = sync_interval;
+        recorder_config.clock = clock;
         return recorder->init(recorder_config);
     }
 
@@ -377,6 +380,143 @@ TEST_F(JournalRecovery, ReplayShowsTheHighestOrderIdOfEachSession) {
     note_order_id(test::new_order(7, 3, core::Side::Buy, 950, 1, 5), small);
     EXPECT_EQ(room[7], 5U);
     EXPECT_EQ(room[8], 0U) << "written past the end of the table";
+}
+
+// A clock the tests set. Every reading also moves it on by g_step_ns, which
+// is how a test makes a sync "take" time: the recorder reads the clock
+// before and after.
+std::uint64_t g_now_ns = 0;
+std::uint64_t g_step_ns = 0;
+std::uint64_t test_clock() noexcept {
+    const std::uint64_t now = g_now_ns;
+    g_now_ns += g_step_ns;
+    return now;
+}
+
+constexpr std::uint64_t kMilli = 1'000'000;
+// A histogram keeps a value to within one bucket, about 3 percent.
+::testing::AssertionResult about(std::uint64_t actual, std::uint64_t expected) {
+    const std::uint64_t slack = expected / 30;
+    if (actual + slack >= expected && actual <= expected + slack) {
+        return ::testing::AssertionSuccess();
+    }
+    return ::testing::AssertionFailure() << actual << " is not about " << expected;
+}
+
+class JournalTimes : public JournalRecovery {
+protected:
+    void SetUp() override {
+        JournalRecovery::SetUp();
+        g_now_ns = 1000 * kMilli;
+        g_step_ns = 0;
+        run_.clock = test_clock;
+    }
+
+    // One command through the shard and into the journal ring.
+    void command() {
+        ASSERT_TRUE(run_.shard->commands().try_push(
+            test::new_order(1, 3, core::Side::Buy, 950, 1, ++orders_)));
+        ASSERT_EQ(run_.shard->poll(), 1U);
+        run_.audit_reports = false;  // pushed by hand, not through the flow
+        run_.collect();
+    }
+
+    Session run_;
+    std::uint64_t orders_ = 0;
+};
+
+TEST_F(JournalTimes, ARecordWaitsFromWhenItWasTakenToTheSyncThatCoversIt) {
+    ASSERT_EQ(run_.start(dir_.path(), journaling_shard(), core::Nanos{10 * kMilli}), Status::Ok);
+    const Recorder& recorder = *run_.recorder;
+    for (int i = 0; i < 3; ++i) {
+        command();
+    }
+    ASSERT_EQ(run_.recorder->poll(), 3U);
+    EXPECT_TRUE(recorder.durable_times().empty()) << "counted as safe before any sync";
+
+    g_now_ns += 4 * kMilli;
+    command();
+    command();
+    ASSERT_EQ(run_.recorder->poll(), 2U);
+    EXPECT_EQ(recorder.stats().syncs, 0U);
+
+    // The interval is up. Three records have waited 10 ms and two 6 ms.
+    g_now_ns += 6 * kMilli;
+    ASSERT_EQ(run_.recorder->poll(), 0U);
+    ASSERT_EQ(recorder.stats().syncs, 1U);
+    EXPECT_EQ(recorder.durable_times().count(), 5U) << "one sample for every record";
+    EXPECT_EQ(recorder.durable_times().max(), 10 * kMilli);
+    EXPECT_EQ(recorder.durable_times().min(), 6 * kMilli);
+    EXPECT_TRUE(about(recorder.durable_times().percentile(0.5), 10 * kMilli));
+    EXPECT_TRUE(about(recorder.durable_times().percentile(0.2), 6 * kMilli));
+    EXPECT_EQ(recorder.sync_times().count(), 1U);
+
+    // Nothing waits twice: the next sync covers only what came after.
+    command();
+    ASSERT_EQ(run_.recorder->poll(), 1U);
+    g_now_ns += 10 * kMilli;
+    ASSERT_EQ(run_.recorder->poll(), 0U);
+    EXPECT_EQ(recorder.durable_times().count(), 6U);
+    EXPECT_EQ(recorder.durable_times().max(), 10 * kMilli);
+}
+
+TEST_F(JournalTimes, TheTimeASyncTakesIsMeasuredAndIsPartOfTheWait) {
+    // Synced after every write. Each reading of the clock moves it 1 ms: the
+    // recorder reads it as a pass starts, once more to see whether a sync
+    // is due, then before the sync and after.
+    ASSERT_EQ(run_.start(dir_.path(), journaling_shard(), core::Nanos{0}), Status::Ok);
+    const Recorder& recorder = *run_.recorder;
+    g_step_ns = kMilli;
+    command();
+    ASSERT_EQ(run_.recorder->poll(), 1U);
+    g_step_ns = 0;
+    ASSERT_EQ(recorder.stats().syncs, 1U);
+    EXPECT_EQ(recorder.sync_times().count(), 1U);
+    EXPECT_EQ(recorder.sync_times().max(), kMilli);
+    EXPECT_EQ(recorder.durable_times().count(), 1U);
+    EXPECT_EQ(recorder.durable_times().max(), 3 * kMilli)
+        << "the wait ends when the sync has finished, not when it starts";
+}
+
+TEST_F(JournalTimes, RecordsTakenCloseTogetherAreTimedFromTheEarliest) {
+    // An hour between syncs: a 512th of that is seven seconds, and records
+    // taken within it share one time. Never too low, at most that much too
+    // high.
+    ASSERT_EQ(run_.start(dir_.path(), journaling_shard(), core::Nanos{3'600'000 * kMilli}),
+              Status::Ok);
+    const Recorder& recorder = *run_.recorder;
+    for (int i = 0; i < 3; ++i) {
+        command();
+        ASSERT_EQ(run_.recorder->poll(), 1U);
+        g_now_ns += 1000 * kMilli;
+    }
+    // Eight seconds after the first: a group of its own.
+    g_now_ns += 5000 * kMilli;
+    command();
+    ASSERT_EQ(run_.recorder->poll(), 1U);
+    g_now_ns += 2000 * kMilli;
+    EXPECT_TRUE(recorder.durable_times().empty());
+    run_.stop();  // a clean shutdown syncs
+    EXPECT_EQ(recorder.durable_times().count(), 4U);
+    EXPECT_EQ(recorder.durable_times().max(), 10'000 * kMilli);
+    EXPECT_EQ(recorder.durable_times().min(), 2000 * kMilli);
+    EXPECT_TRUE(about(recorder.durable_times().percentile(0.5), 10'000 * kMilli))
+        << "three of the four were taken within seven seconds of the first";
+}
+
+TEST_F(JournalTimes, EveryRecordOfARealRunIsTimed) {
+    run_.clock = nullptr;  // the real clock
+    ASSERT_EQ(run_.start(dir_.path(), journaling_shard(), core::Nanos{0}), Status::Ok);
+    test::RandomFlow flow(5);
+    run_.trade(flow, 500);
+    run_.stop();
+    const RecorderStats& stats = run_.recorder->stats();
+    ASSERT_GT(stats.records, 400U);
+    EXPECT_EQ(run_.recorder->durable_times().count(), stats.records);
+    EXPECT_EQ(run_.recorder->sync_times().count(), stats.syncs);
+    EXPECT_GE(run_.recorder->durable_times().min(), run_.recorder->sync_times().min())
+        << "a record was safe sooner than the sync that made it safe";
+    EXPECT_LT(run_.recorder->durable_times().max(), 60'000 * kMilli);
 }
 
 TEST_F(JournalRecovery, SyncsAsOftenAsItWasToldTo) {

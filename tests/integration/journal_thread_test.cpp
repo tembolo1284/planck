@@ -105,6 +105,8 @@ TEST(JournalThreads, EveryCommandReachesTheFileInOrder) {
     EXPECT_EQ(recorder->stats().records, commands);
     EXPECT_EQ(recorder->stats().discarded, 0U);
     EXPECT_GT(recorder->stats().syncs, 0U);
+    EXPECT_EQ(recorder->durable_times().count(), commands) << "one wait timed for every record";
+    EXPECT_EQ(recorder->sync_times().count(), recorder->stats().syncs);
     EXPECT_LT(recorder->stats().writes, commands) << "one write per record: nothing is being batched";
 
     Path path;

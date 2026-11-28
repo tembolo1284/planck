@@ -55,7 +55,14 @@ Status Recorder::init(const RecorderConfig& config) noexcept {
     }
 
     sync_interval_ns_ = config.sync_interval.raw();
-    last_sync_ns_ = sys::monotonic_now().raw();
+    clock_ = config.clock;
+    // A sync interval is cut into at most 512 groups of records, so the
+    // kMaxWaiting a stream can hold are enough even if a sync comes late.
+    resolution_ns_ = sync_interval_ns_ / 512;
+    if (resolution_ns_ < kDurableResolutionNs) {
+        resolution_ns_ = kDurableResolutionNs;
+    }
+    last_sync_ns_ = now();
     idle_ = config.idle;
     stream_count_ = config.shards.size();
     return Status::Ok;
@@ -64,6 +71,9 @@ Status Recorder::init(const RecorderConfig& config) noexcept {
 std::size_t Recorder::poll() noexcept {
     PLANCK_EXPECT(initialised());
 
+    // Read before anything is taken, so that a record's wait is measured
+    // from no later than the moment it was taken.
+    const std::uint64_t started = now();
     std::size_t taken = 0;
     for (std::size_t i = 0; i < stream_count_; ++i) {
         Stream& stream = streams_[i];
@@ -94,16 +104,36 @@ std::size_t Recorder::poll() noexcept {
         stats_.bytes += pending;
         ++stats_.writes;
         stream.unsynced = true;
+        note_taken(stream, started, drained);
     }
 
     if (!failed_) {
-        const std::uint64_t now = sys::monotonic_now().raw();
-        if (sync_interval_ns_ == 0 || (now - last_sync_ns_) >= sync_interval_ns_) {
+        const std::uint64_t time = now();
+        if (sync_interval_ns_ == 0 || (time - last_sync_ns_) >= sync_interval_ns_) {
             sync_all();
-            last_sync_ns_ = now;
+            last_sync_ns_ = time;
         }
     }
     return taken;
+}
+
+std::uint64_t Recorder::now() const noexcept {
+    return (clock_ != nullptr) ? clock_() : sys::monotonic_now().raw();
+}
+
+void Recorder::note_taken(Stream& stream, std::uint64_t taken_ns, std::uint64_t records) noexcept {
+    if (stream.waiting_count != 0) {
+        Waiting& last = stream.waiting[stream.waiting_count - 1];
+        // Close enough to the last group to share its time, or no room for
+        // a group of its own. Either way it is timed from the earlier
+        // moment, which can only make its wait look longer.
+        if (taken_ns - last.taken_ns < resolution_ns_ || stream.waiting_count == kMaxWaiting) {
+            last.records += records;
+            return;
+        }
+    }
+    stream.waiting[stream.waiting_count] = Waiting{taken_ns, records};
+    ++stream.waiting_count;
 }
 
 void Recorder::run(const std::atomic<bool>& stop) noexcept {
@@ -132,12 +162,21 @@ void Recorder::sync_all() noexcept {
         if (!stream.unsynced) {
             continue;
         }
+        const std::uint64_t before = now();
         if (const Status status = stream.writer.sync(); !ok(status)) {
             fail(status);
             return;
         }
+        const std::uint64_t safe = now();
         stream.unsynced = false;
         ++stats_.syncs;
+        sync_times_.record(safe - before);
+        // Everything this stream was waiting with is on disk as of now.
+        for (std::size_t group = 0; group < stream.waiting_count; ++group) {
+            const Waiting& waiting = stream.waiting[group];
+            durable_times_.record(safe - waiting.taken_ns, waiting.records);
+        }
+        stream.waiting_count = 0;
     }
 }
 

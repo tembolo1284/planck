@@ -5,7 +5,7 @@ target_link_libraries(planck_bench_support PUBLIC planck::perf planck::sys planc
 
 # The pieces of the engine, timed in process.
 add_executable(planck-bench planck_bench.cpp)
-target_link_libraries(planck-bench PRIVATE planck_bench_support planck::engine)
+target_link_libraries(planck-bench PRIVATE planck_bench_support planck::engine planck::journal)
 
 # A running planckd, timed from outside over TCP.
 add_executable(planck-loadgen planck_loadgen.cpp)
